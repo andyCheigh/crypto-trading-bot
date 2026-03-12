@@ -1,0 +1,55 @@
+# ============================================================
+# Crypto Trading Bot Configuration
+# ============================================================
+
+exchange:
+  name: binance            # Supported: binance, coinbase, kraken, bybit, okx, etc.
+  sandbox: false           # Use exchange's sandbox/testnet if available
+
+trading:
+  mode: dry_run            # "dry_run" = paper trading, "live" = real money
+  symbols:
+    - BTC/USDT
+    - ETH/USDT
+  timeframe: 1h            # Candle interval: 1m, 5m, 15m, 1h, 4h, 1d
+  candle_limit: 200        # Number of historical candles to fetch
+  poll_interval_seconds: 60
+
+strategy:
+  # EMA Crossover
+  ema_fast: 12
+  ema_slow: 26
+
+  # RSI
+  rsi_period: 14
+  rsi_oversold: 30
+  rsi_overbought: 70
+
+  # Bollinger Bands
+  bb_period: 20
+  bb_std_dev: 2.0
+
+  # MACD
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+
+  # Minimum signals required to trigger a trade (out of 4)
+  min_signals_buy: 3
+  min_signals_sell: 3
+
+risk:
+  max_position_pct: 0.25       # Max 25% of portfolio per position
+  stop_loss_pct: 0.03          # 3% stop loss
+  take_profit_pct: 0.06        # 6% take profit (2:1 reward/risk)
+  max_drawdown_pct: 0.15       # 15% max drawdown circuit breaker
+  max_open_positions: 3
+
+dry_run:
+  starting_balance:
+    USDT: 10000.0
+  # Or specify your actual holdings to simulate:
+  # starting_balance:
+  #   USDT: 5000.0
+  #   BTC: 0.15
+  #   ETH: 2.5

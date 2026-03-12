@@ -1,0 +1,22 @@
+[project]
+name = "crypto-trading-bot"
+version = "1.0.0"
+description = "Multi-signal crypto trading bot with dry-run mode"
+requires-python = ">=3.11"
+dependencies = [
+    "ccxt>=4.0.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "ta>=0.11.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+    "schedule>=1.2.0",
+    "colorama>=0.4.6",
+]
+
+[project.scripts]
+trading-bot = "bot.main:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
