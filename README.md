@@ -61,6 +61,33 @@ dry_run:
 - **Circuit breaker**: Halts trading at 15% max drawdown
 - **Max positions**: 3 concurrent positions
 
+## Deploy to Cloud (Free)
+
+One-command setup for Oracle Cloud Free Tier or any Ubuntu VM:
+
+```bash
+git clone https://github.com/andyCheigh/crypto-trading-bot.git
+cd crypto-trading-bot
+bash deploy/setup.sh
+```
+
+Then configure and start:
+
+```bash
+cp .env.example .env && nano .env       # add API keys
+nano config.yaml                         # adjust settings
+sudo systemctl start trading-bot         # start the bot
+```
+
+The bot auto-starts on boot and restarts on crashes. Useful commands:
+
+```bash
+sudo systemctl status trading-bot        # check status
+sudo journalctl -u trading-bot -f        # live logs
+sudo systemctl restart trading-bot       # restart
+sudo systemctl stop trading-bot          # stop
+```
+
 ## Disclaimer
 
 This bot is for educational purposes. Cryptocurrency trading involves substantial risk. Past performance does not guarantee future results. Use at your own risk.
