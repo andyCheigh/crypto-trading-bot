@@ -5,7 +5,6 @@ Telegram bot for sending trade signals and portfolio updates.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -19,9 +18,7 @@ class TelegramNotifier:
         self.chat_id = chat_id
 
     async def send(self, message: str):
-        """Send a message to the configured chat."""
         try:
-            # Telegram max message length is 4096
             if len(message) > 4000:
                 message = message[:4000] + "\n..."
             await self.bot.send_message(
@@ -31,12 +28,8 @@ class TelegramNotifier:
             )
         except Exception as e:
             logger.error(f"Telegram send failed: {e}")
-            # Fallback without markdown
             try:
-                await self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=message,
-                )
+                await self.bot.send_message(chat_id=self.chat_id, text=message)
             except Exception as e2:
                 logger.error(f"Telegram fallback send also failed: {e2}")
 
@@ -49,14 +42,15 @@ class TelegramNotifier:
         ensemble_score: float,
         portfolio_status: str,
     ):
-        algo_lines = "\n".join(f"  {name}: {score:.4f}" for name, score in scores.items())
+        algo_lines = "\n".join(
+            f"  {name.replace('_', ' ').title()}: {score:.4f}"
+            for name, score in scores.items()
+        )
         msg = (
             f"BUY SIGNAL: {symbol}\n"
-            f"Price: ${price:.2f}\n"
-            f"Shares: {shares}\n"
-            f"Cost: ${price * shares:,.2f}\n"
+            f"Price: ${price:.2f} | Shares: {shares} | Cost: ${price * shares:,.2f}\n"
             f"\n"
-            f"Algorithm Scores:\n{algo_lines}\n"
+            f"Options-Driven Scores:\n{algo_lines}\n"
             f"Ensemble: {ensemble_score:.4f}\n"
             f"\n"
             f"{portfolio_status}"
@@ -76,8 +70,7 @@ class TelegramNotifier:
         arrow = "+" if pnl >= 0 else ""
         msg = (
             f"SELL SIGNAL: {symbol}\n"
-            f"Price: ${price:.2f}\n"
-            f"Shares: {shares}\n"
+            f"Price: ${price:.2f} | Shares: {shares}\n"
             f"P&L: {arrow}${pnl:.2f} ({arrow}{pnl_pct:.2%})\n"
             f"Reason: {reason}\n"
             f"\n"
@@ -87,10 +80,11 @@ class TelegramNotifier:
 
     async def send_startup(self, portfolio_status: str):
         msg = (
-            f"TRADING BOT STARTED\n"
+            f"OPTIONS TRADING BOT STARTED\n"
             f"Sell check: every 15s\n"
             f"Buy scan: every 60s\n"
-            f"Max holdings: 5\n"
+            f"EOD close: 3:45 PM ET\n"
+            f"Max holdings: 10\n"
             f"\n"
             f"{portfolio_status}"
         )

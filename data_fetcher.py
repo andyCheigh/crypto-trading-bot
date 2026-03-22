@@ -1,60 +1,166 @@
 """
-Data fetcher that pulls in-depth stock metrics:
-- OHLCV price history
-- Options chain with Greeks (delta, gamma, theta, vega)
-- Implied volatility surface
-- Volume profile and order flow proxies
-- Fundamental ratios
+Options-focused data fetcher for prop-desk style trading.
+Pulls full options chains across multiple expirations to compute:
+- Greeks surface (delta, gamma, theta, vega per strike/expiry)
+- Dealer gamma exposure (GEX) with gamma flip level
+- Vanna & charm flow predictions
+- IV surface: term structure, skew, smile
+- Unusual options activity detection
+- Volume profile & order flow proxies
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from scipy.stats import norm
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Black-Scholes Greeks calculator
+# ---------------------------------------------------------------------------
+
+def _bs_d1(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    return (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+
+
+def _bs_d2(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    return _bs_d1(S, K, T, r, sigma) - sigma * math.sqrt(T) if T > 0 and sigma > 0 else 0.0
+
+
+def bs_delta(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    if T <= 0 or sigma <= 0:
+        return (1.0 if S > K else 0.0) if is_call else (-1.0 if S < K else 0.0)
+    d1 = _bs_d1(S, K, T, r, sigma)
+    return float(norm.cdf(d1) if is_call else norm.cdf(d1) - 1)
+
+
+def bs_gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return 0.0
+    d1 = _bs_d1(S, K, T, r, sigma)
+    return float(norm.pdf(d1) / (S * sigma * math.sqrt(T)))
+
+
+def bs_theta(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = _bs_d1(S, K, T, r, sigma)
+    d2 = _bs_d2(S, K, T, r, sigma)
+    term1 = -(S * norm.pdf(d1) * sigma) / (2 * math.sqrt(T))
+    if is_call:
+        return float((term1 - r * K * math.exp(-r * T) * norm.cdf(d2)) / 365)
+    return float((term1 + r * K * math.exp(-r * T) * norm.cdf(-d2)) / 365)
+
+
+def bs_vega(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = _bs_d1(S, K, T, r, sigma)
+    return float(S * norm.pdf(d1) * math.sqrt(T) / 100)  # per 1% vol move
+
+
+def bs_vanna(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """dDelta/dVol = dVega/dSpot. Measures how delta changes with vol."""
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return 0.0
+    d1 = _bs_d1(S, K, T, r, sigma)
+    d2 = _bs_d2(S, K, T, r, sigma)
+    return float(-norm.pdf(d1) * d2 / sigma)
+
+
+def bs_charm(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    """dDelta/dTime. How delta decays as time passes (delta bleed)."""
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = _bs_d1(S, K, T, r, sigma)
+    d2 = _bs_d2(S, K, T, r, sigma)
+    charm_val = -norm.pdf(d1) * (2 * r * T - d2 * sigma * math.sqrt(T)) / (2 * T * sigma * math.sqrt(T))
+    if not is_call:
+        charm_val += r * math.exp(-r * T) * norm.cdf(-d2)
+    return float(charm_val / 365)
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
 @dataclass
-class OptionsMetrics:
-    iv_atm: float = 0.0              # At-the-money implied volatility
-    iv_skew: float = 0.0             # Put IV - Call IV (skew)
-    put_call_ratio: float = 1.0      # Put volume / Call volume
-    avg_delta_calls: float = 0.0     # Average delta of near-ATM calls
-    avg_delta_puts: float = 0.0      # Average delta of near-ATM puts
-    avg_gamma: float = 0.0           # Average gamma near ATM
-    avg_theta: float = 0.0           # Average theta (time decay)
-    avg_vega: float = 0.0            # Average vega (vol sensitivity)
-    max_pain: float = 0.0            # Max pain strike price
-    net_gamma_exposure: float = 0.0  # Dealer gamma exposure proxy
+class OptionsGreeks:
+    """Per-strike greeks computed via Black-Scholes."""
+    strike: float = 0.0
+    expiry: str = ""
+    is_call: bool = True
+    iv: float = 0.0
+    delta: float = 0.0
+    gamma: float = 0.0
+    theta: float = 0.0
+    vega: float = 0.0
+    vanna: float = 0.0
+    charm: float = 0.0
+    open_interest: int = 0
+    volume: int = 0
+
+
+@dataclass
+class GEXProfile:
+    """Dealer Gamma Exposure profile."""
+    net_gex: float = 0.0              # Net gamma exposure (positive = dealer long gamma)
+    gex_per_strike: dict = field(default_factory=dict)  # strike -> GEX$
+    gamma_flip_level: float = 0.0     # Price where GEX flips sign
+    call_wall: float = 0.0            # Strike with highest call OI * gamma
+    put_wall: float = 0.0             # Strike with highest put OI * gamma
+    net_vanna_exposure: float = 0.0   # Aggregate vanna flow
+    net_charm_exposure: float = 0.0   # Aggregate charm (delta bleed)
+
+
+@dataclass
+class IVSurface:
+    """Implied volatility surface metrics."""
+    iv_atm: float = 0.0              # ATM implied vol
+    iv_25d_call: float = 0.0         # 25-delta call IV
+    iv_25d_put: float = 0.0          # 25-delta put IV
+    skew_25d: float = 0.0            # 25d put IV - 25d call IV (risk reversal)
+    iv_term_slope: float = 0.0       # Front month IV - back month IV (backwardation = +)
+    iv_rv_spread: float = 0.0        # IV - realized vol (vol risk premium)
+    iv_percentile_20d: float = 0.5   # Where current IV sits vs 20d range
+    rv_5d: float = 0.0               # 5-day realized vol
+    rv_10d: float = 0.0              # 10-day realized vol
+    rv_20d: float = 0.0              # 20-day realized vol
+
+
+@dataclass
+class OptionsFlow:
+    """Options order flow and unusual activity metrics."""
+    put_call_vol_ratio: float = 1.0  # Put vol / Call vol
+    put_call_oi_ratio: float = 1.0   # Put OI / Call OI
+    unusual_calls: int = 0           # Strikes where vol > 2x OI (smart money)
+    unusual_puts: int = 0
+    total_call_premium: float = 0.0  # $ spent on calls today
+    total_put_premium: float = 0.0   # $ spent on puts today
+    net_premium_flow: float = 0.0    # Call premium - Put premium (bullish flow)
+    max_pain: float = 0.0
 
 
 @dataclass
 class VolumeProfile:
-    vwap: float = 0.0                # Volume-weighted average price
-    relative_volume: float = 1.0     # Current vol / 20-day avg vol
-    volume_trend: float = 0.0        # Volume momentum (5d vs 20d)
-    accumulation_dist: float = 0.0   # Accumulation/Distribution line value
-    obv_slope: float = 0.0           # On-Balance Volume slope
-
-
-@dataclass
-class Fundamentals:
-    market_cap: float = 0.0
-    pe_ratio: float = 0.0
-    forward_pe: float = 0.0
-    pb_ratio: float = 0.0
-    dividend_yield: float = 0.0
-    short_ratio: float = 0.0
-    beta: float = 1.0
-    earnings_date: Optional[str] = None
+    vwap: float = 0.0
+    relative_volume: float = 1.0
+    volume_trend: float = 0.0
+    accumulation_dist: float = 0.0
+    obv_slope: float = 0.0
 
 
 @dataclass
@@ -62,24 +168,33 @@ class StockData:
     symbol: str
     price: float = 0.0
     timestamp: datetime = field(default_factory=datetime.now)
-    # Price history
     ohlcv: Optional[pd.DataFrame] = None
-    # Derived metrics
-    options: OptionsMetrics = field(default_factory=OptionsMetrics)
+    # Options-driven metrics (the core of our signals)
+    gex: GEXProfile = field(default_factory=GEXProfile)
+    iv_surface: IVSurface = field(default_factory=IVSurface)
+    options_flow: OptionsFlow = field(default_factory=OptionsFlow)
+    # All computed greeks per strike (for algo use)
+    greeks_chain: list = field(default_factory=list)
+    # Price-based
     volume_profile: VolumeProfile = field(default_factory=VolumeProfile)
-    fundamentals: Fundamentals = field(default_factory=Fundamentals)
-    # Technical
     returns_1d: float = 0.0
     returns_5d: float = 0.0
     returns_20d: float = 0.0
-    volatility_20d: float = 0.0
     atr_14: float = 0.0
+    # Fundamentals
+    market_cap: float = 0.0
+    beta: float = 1.0
+    short_ratio: float = 0.0
+    earnings_date: Optional[str] = None
+    days_to_earnings: int = 999
 
+
+# ---------------------------------------------------------------------------
+# Computation helpers
+# ---------------------------------------------------------------------------
 
 def _compute_atr(df: pd.DataFrame, period: int = 14) -> float:
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
+    high, low, close = df["High"], df["Low"], df["Close"]
     tr = pd.concat([
         high - low,
         (high - close.shift(1)).abs(),
@@ -93,158 +208,279 @@ def _compute_volume_profile(df: pd.DataFrame) -> VolumeProfile:
     vp = VolumeProfile()
     if df.empty or len(df) < 20:
         return vp
+    close, volume, high, low = df["Close"], df["Volume"], df["High"], df["Low"]
 
-    close = df["Close"]
-    volume = df["Volume"]
-    high = df["High"]
-    low = df["Low"]
-
-    # VWAP (intraday proxy using daily data)
     typical = (high + low + close) / 3
     vp.vwap = float((typical * volume).sum() / volume.sum()) if volume.sum() > 0 else float(close.iloc[-1])
 
-    # Relative volume
     avg_vol_20 = volume.rolling(20).mean().iloc[-1]
-    if avg_vol_20 > 0:
-        vp.relative_volume = float(volume.iloc[-1] / avg_vol_20)
-
-    # Volume trend: 5d avg vs 20d avg
     avg_vol_5 = volume.rolling(5).mean().iloc[-1]
     if avg_vol_20 > 0:
+        vp.relative_volume = float(volume.iloc[-1] / avg_vol_20)
         vp.volume_trend = float((avg_vol_5 - avg_vol_20) / avg_vol_20)
 
-    # Accumulation/Distribution
     mfm = ((close - low) - (high - close)) / (high - low + 1e-10)
-    ad = (mfm * volume).cumsum()
-    vp.accumulation_dist = float(ad.iloc[-1])
+    vp.accumulation_dist = float((mfm * volume).cumsum().iloc[-1])
 
-    # OBV slope (linear regression over last 10 days)
     obv = (np.sign(close.diff()) * volume).cumsum()
     if len(obv) >= 10:
         x = np.arange(10)
-        y = obv.iloc[-10:].values
-        slope = np.polyfit(x, y, 1)[0]
-        vp.obv_slope = float(slope)
-
+        vp.obv_slope = float(np.polyfit(x, obv.iloc[-10:].values, 1)[0])
     return vp
 
 
-def _compute_options_metrics(ticker: yf.Ticker, current_price: float) -> OptionsMetrics:
-    om = OptionsMetrics()
+def _compute_full_options(ticker: yf.Ticker, S: float, rv_20d: float) -> tuple:
+    """Compute full options analytics across multiple expirations.
+    Returns (GEXProfile, IVSurface, OptionsFlow, greeks_chain).
+    """
+    gex = GEXProfile()
+    ivs = IVSurface()
+    flow = OptionsFlow()
+    greeks_chain = []
+
+    r = 0.05  # risk-free rate proxy
+
     try:
         expirations = ticker.options
         if not expirations:
-            return om
+            return gex, ivs, flow, greeks_chain
 
-        # Use nearest expiration for liquid, actionable greeks
-        nearest_exp = expirations[0]
-        chain = ticker.option_chain(nearest_exp)
-        calls = chain.calls
-        puts = chain.puts
+        # Use up to 3 nearest expirations for rich surface data
+        exps_to_use = expirations[:min(3, len(expirations))]
 
-        if calls.empty or puts.empty:
-            return om
+        all_call_vol = 0
+        all_put_vol = 0
+        all_call_oi = 0
+        all_put_oi = 0
+        all_call_premium = 0.0
+        all_put_premium = 0.0
+        unusual_calls = 0
+        unusual_puts = 0
 
-        # Filter near-ATM options (within 5% of current price)
-        atm_range = current_price * 0.05
-        near_calls = calls[
-            (calls["strike"] >= current_price - atm_range) &
-            (calls["strike"] <= current_price + atm_range)
-        ].copy()
-        near_puts = puts[
-            (puts["strike"] >= current_price - atm_range) &
-            (puts["strike"] <= current_price + atm_range)
-        ].copy()
+        gex_by_strike = {}
+        total_vanna = 0.0
+        total_charm = 0.0
 
-        if near_calls.empty or near_puts.empty:
-            return om
+        # IV by expiry for term structure
+        atm_ivs_by_dte = {}
 
-        # ATM Implied Volatility (average of nearest call + put)
-        atm_call = calls.iloc[(calls["strike"] - current_price).abs().argsort()[:1]]
-        atm_put = puts.iloc[(puts["strike"] - current_price).abs().argsort()[:1]]
-        call_iv = float(atm_call["impliedVolatility"].iloc[0]) if "impliedVolatility" in atm_call.columns else 0.0
-        put_iv = float(atm_put["impliedVolatility"].iloc[0]) if "impliedVolatility" in atm_put.columns else 0.0
-        om.iv_atm = (call_iv + put_iv) / 2
-        om.iv_skew = put_iv - call_iv
+        for exp_str in exps_to_use:
+            try:
+                chain = ticker.option_chain(exp_str)
+            except Exception:
+                continue
+            calls, puts = chain.calls, chain.puts
+            if calls.empty or puts.empty:
+                continue
 
-        # Put/Call ratio by volume
-        total_call_vol = calls["volume"].sum() if "volume" in calls.columns else 0
-        total_put_vol = puts["volume"].sum() if "volume" in puts.columns else 0
-        if total_call_vol > 0:
-            om.put_call_ratio = float(total_put_vol / total_call_vol)
+            # Days to expiry
+            exp_date = datetime.strptime(exp_str, "%Y-%m-%d")
+            dte = max((exp_date - datetime.now()).days, 1)
+            T = dte / 365.0
 
-        # Greeks from near-ATM options
-        for col, attr in [("delta", "avg_delta_calls"), ("gamma", "avg_gamma"),
-                          ("theta", "avg_theta"), ("vega", "avg_vega")]:
-            # yfinance doesn't always provide greeks directly; use what's available
-            pass
+            # Process calls
+            for _, row in calls.iterrows():
+                K = float(row["strike"])
+                iv = float(row.get("impliedVolatility", 0) or 0)
+                oi = int(row.get("openInterest", 0) or 0)
+                vol = int(row.get("volume", 0) or 0)
+                last = float(row.get("lastPrice", 0) or 0)
 
-        # Estimate greeks from Black-Scholes approximations when not provided
-        # Delta proxy: moneyness-based
-        if not near_calls.empty:
-            moneyness = near_calls["strike"] / current_price
-            om.avg_delta_calls = float((1 - moneyness).clip(-1, 1).mean())
-        if not near_puts.empty:
-            moneyness = near_puts["strike"] / current_price
-            om.avg_delta_puts = float((moneyness - 1).clip(-1, 0).mean())
+                if iv <= 0 or iv > 5.0:
+                    continue
 
-        # Gamma proxy: highest near ATM
-        om.avg_gamma = float(om.iv_atm / (current_price * 0.01)) if om.iv_atm > 0 else 0.0
+                delta = bs_delta(S, K, T, r, iv, True)
+                gamma = bs_gamma(S, K, T, r, iv)
+                theta = bs_theta(S, K, T, r, iv, True)
+                vega = bs_vega(S, K, T, r, iv)
+                van = bs_vanna(S, K, T, r, iv)
+                chrm = bs_charm(S, K, T, r, iv, True)
 
-        # Theta proxy: time decay estimate (negative for long positions)
-        om.avg_theta = float(-om.iv_atm * current_price / (365 * 2)) if om.iv_atm > 0 else 0.0
+                greeks_chain.append(OptionsGreeks(
+                    strike=K, expiry=exp_str, is_call=True,
+                    iv=iv, delta=delta, gamma=gamma, theta=theta,
+                    vega=vega, vanna=van, charm=chrm,
+                    open_interest=oi, volume=vol,
+                ))
 
-        # Vega proxy: sensitivity to 1% IV change
-        om.avg_vega = float(current_price * 0.01 * om.iv_atm) if om.iv_atm > 0 else 0.0
+                # GEX: dealer is short calls → short gamma on calls
+                # Dealer GEX for calls = -OI * 100 * gamma * S (negative because short)
+                gex_val = -oi * 100 * gamma * S
+                gex_by_strike[K] = gex_by_strike.get(K, 0.0) + gex_val
 
-        # Max Pain: strike where total $ value of options expiring worthless is maximized
-        all_strikes = sorted(set(calls["strike"].tolist() + puts["strike"].tolist()))
-        pain = {}
-        for strike in all_strikes:
-            call_pain = calls[calls["strike"] < strike].apply(
-                lambda r: (strike - r["strike"]) * r.get("openInterest", 0), axis=1
-            ).sum()
-            put_pain = puts[puts["strike"] > strike].apply(
-                lambda r: (r["strike"] - strike) * r.get("openInterest", 0), axis=1
-            ).sum()
-            pain[strike] = call_pain + put_pain
-        if pain:
-            om.max_pain = min(pain, key=pain.get)
+                # Vanna/Charm flow (dealer short calls → flip signs)
+                total_vanna += -oi * 100 * van
+                total_charm += -oi * 100 * chrm
 
-        # Net gamma exposure proxy
-        call_gamma_exp = (near_calls.get("openInterest", pd.Series([0])) * 100 * om.avg_gamma).sum()
-        put_gamma_exp = (near_puts.get("openInterest", pd.Series([0])) * 100 * om.avg_gamma).sum()
-        om.net_gamma_exposure = float(call_gamma_exp - put_gamma_exp)
+                all_call_vol += vol
+                all_call_oi += oi
+                all_call_premium += vol * last * 100
+
+                if oi > 0 and vol > 2 * oi:
+                    unusual_calls += 1
+
+                # Track ATM IV for term structure
+                if abs(K - S) / S < 0.02:
+                    atm_ivs_by_dte[dte] = iv
+
+            # Process puts
+            for _, row in puts.iterrows():
+                K = float(row["strike"])
+                iv = float(row.get("impliedVolatility", 0) or 0)
+                oi = int(row.get("openInterest", 0) or 0)
+                vol = int(row.get("volume", 0) or 0)
+                last = float(row.get("lastPrice", 0) or 0)
+
+                if iv <= 0 or iv > 5.0:
+                    continue
+
+                delta = bs_delta(S, K, T, r, iv, False)
+                gamma = bs_gamma(S, K, T, r, iv)
+                theta = bs_theta(S, K, T, r, iv, False)
+                vega = bs_vega(S, K, T, r, iv)
+                van = bs_vanna(S, K, T, r, iv)
+                chrm = bs_charm(S, K, T, r, iv, False)
+
+                greeks_chain.append(OptionsGreeks(
+                    strike=K, expiry=exp_str, is_call=False,
+                    iv=iv, delta=delta, gamma=gamma, theta=theta,
+                    vega=vega, vanna=van, charm=chrm,
+                    open_interest=oi, volume=vol,
+                ))
+
+                # GEX: dealer is short puts → long gamma on puts
+                # Dealer GEX for puts = +OI * 100 * gamma * S (positive because long)
+                gex_val = oi * 100 * gamma * S
+                gex_by_strike[K] = gex_by_strike.get(K, 0.0) + gex_val
+
+                total_vanna += oi * 100 * van
+                total_charm += oi * 100 * chrm
+
+                all_put_vol += vol
+                all_put_oi += oi
+                all_put_premium += vol * last * 100
+
+                if oi > 0 and vol > 2 * oi:
+                    unusual_puts += 1
+
+            # Max pain from first expiry
+            if exp_str == exps_to_use[0]:
+                flow.max_pain = _compute_max_pain(calls, puts)
+
+        # --- Assemble GEX profile ---
+        gex.gex_per_strike = gex_by_strike
+        gex.net_gex = sum(gex_by_strike.values())
+        gex.net_vanna_exposure = total_vanna
+        gex.net_charm_exposure = total_charm
+
+        # Gamma flip: find strike where cumulative GEX crosses zero
+        if gex_by_strike:
+            sorted_strikes = sorted(gex_by_strike.keys())
+            cum = 0.0
+            for k in sorted_strikes:
+                prev_cum = cum
+                cum += gex_by_strike[k]
+                if prev_cum <= 0 < cum or prev_cum >= 0 > cum:
+                    gex.gamma_flip_level = k
+                    break
+
+            # Call wall: highest call GEX strike (most positive for calls)
+            call_gex = {k: v for k, v in gex_by_strike.items() if v < 0}
+            if call_gex:
+                gex.call_wall = min(call_gex, key=call_gex.get)  # most negative = biggest call wall
+            put_gex = {k: v for k, v in gex_by_strike.items() if v > 0}
+            if put_gex:
+                gex.put_wall = max(put_gex, key=put_gex.get)
+
+        # --- Assemble IV surface ---
+        # ATM IV from nearest expiry
+        nearest_greeks = [g for g in greeks_chain if g.expiry == exps_to_use[0]]
+        atm_calls = [g for g in nearest_greeks if g.is_call and abs(g.strike - S) / S < 0.02]
+        atm_puts = [g for g in nearest_greeks if not g.is_call and abs(g.strike - S) / S < 0.02]
+        if atm_calls:
+            ivs.iv_atm = np.mean([g.iv for g in atm_calls])
+        if atm_calls and atm_puts:
+            ivs.iv_atm = (np.mean([g.iv for g in atm_calls]) + np.mean([g.iv for g in atm_puts])) / 2
+
+        # 25-delta skew (risk reversal)
+        d25_calls = [g for g in nearest_greeks if g.is_call and 0.20 <= g.delta <= 0.30]
+        d25_puts = [g for g in nearest_greeks if not g.is_call and -0.30 <= g.delta <= -0.20]
+        if d25_calls:
+            ivs.iv_25d_call = np.mean([g.iv for g in d25_calls])
+        if d25_puts:
+            ivs.iv_25d_put = np.mean([g.iv for g in d25_puts])
+        ivs.skew_25d = ivs.iv_25d_put - ivs.iv_25d_call
+
+        # Term structure slope
+        if len(atm_ivs_by_dte) >= 2:
+            sorted_dte = sorted(atm_ivs_by_dte.keys())
+            ivs.iv_term_slope = atm_ivs_by_dte[sorted_dte[0]] - atm_ivs_by_dte[sorted_dte[-1]]
+
+        # IV vs RV spread (vol risk premium)
+        ivs.rv_20d = rv_20d
+        if rv_20d > 0 and ivs.iv_atm > 0:
+            ivs.iv_rv_spread = ivs.iv_atm - rv_20d
+
+        # --- Assemble options flow ---
+        flow.put_call_vol_ratio = float(all_put_vol / max(all_call_vol, 1))
+        flow.put_call_oi_ratio = float(all_put_oi / max(all_call_oi, 1))
+        flow.unusual_calls = unusual_calls
+        flow.unusual_puts = unusual_puts
+        flow.total_call_premium = all_call_premium
+        flow.total_put_premium = all_put_premium
+        flow.net_premium_flow = all_call_premium - all_put_premium
 
     except Exception as e:
-        logger.warning(f"Options fetch failed for ticker: {e}")
+        logger.warning(f"Options analysis failed: {e}")
 
-    return om
+    return gex, ivs, flow, greeks_chain
 
 
-def _compute_fundamentals(ticker: yf.Ticker) -> Fundamentals:
-    f = Fundamentals()
+def _compute_max_pain(calls: pd.DataFrame, puts: pd.DataFrame) -> float:
+    all_strikes = sorted(set(calls["strike"].tolist() + puts["strike"].tolist()))
+    if not all_strikes:
+        return 0.0
+    pain = {}
+    for strike in all_strikes:
+        call_pain = calls[calls["strike"] < strike].apply(
+            lambda r: (strike - r["strike"]) * (r.get("openInterest", 0) or 0), axis=1
+        ).sum()
+        put_pain = puts[puts["strike"] > strike].apply(
+            lambda r: (r["strike"] - strike) * (r.get("openInterest", 0) or 0), axis=1
+        ).sum()
+        pain[strike] = call_pain + put_pain
+    return min(pain, key=pain.get) if pain else 0.0
+
+
+def _compute_fundamentals_lite(ticker: yf.Ticker) -> tuple:
+    """Return (market_cap, beta, short_ratio, earnings_date_str, days_to_earnings)."""
+    mcap, beta, sr, ed_str, dte = 0.0, 1.0, 0.0, None, 999
     try:
         info = ticker.info
-        f.market_cap = info.get("marketCap", 0) or 0
-        f.pe_ratio = info.get("trailingPE", 0) or 0
-        f.forward_pe = info.get("forwardPE", 0) or 0
-        f.pb_ratio = info.get("priceToBook", 0) or 0
-        f.dividend_yield = info.get("dividendYield", 0) or 0
-        f.short_ratio = info.get("shortRatio", 0) or 0
-        f.beta = info.get("beta", 1.0) or 1.0
+        mcap = info.get("marketCap", 0) or 0
+        beta = info.get("beta", 1.0) or 1.0
+        sr = info.get("shortRatio", 0) or 0
         cal = ticker.calendar
         if cal is not None and not (isinstance(cal, pd.DataFrame) and cal.empty):
             if isinstance(cal, dict) and "Earnings Date" in cal:
                 ed = cal["Earnings Date"]
-                f.earnings_date = str(ed[0]) if isinstance(ed, list) and ed else str(ed)
+                if isinstance(ed, list) and ed:
+                    ed_str = str(ed[0])
+                    try:
+                        ed_dt = datetime.strptime(ed_str[:10], "%Y-%m-%d")
+                        dte = (ed_dt - datetime.now()).days
+                    except Exception:
+                        pass
     except Exception as e:
         logger.warning(f"Fundamentals fetch failed: {e}")
-    return f
+    return mcap, beta, sr, ed_str, dte
 
+
+# ---------------------------------------------------------------------------
+# Main fetch functions
+# ---------------------------------------------------------------------------
 
 async def fetch_stock_data(symbol: str) -> StockData:
-    """Fetch comprehensive stock data for a single symbol."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _fetch_stock_data_sync, symbol)
 
@@ -254,7 +490,7 @@ def _fetch_stock_data_sync(symbol: str) -> StockData:
     try:
         ticker = yf.Ticker(symbol)
 
-        # 3-month daily OHLCV for technical analysis
+        # 3-month daily OHLCV
         df = ticker.history(period="3mo", interval="1d")
         if df.empty or len(df) < 20:
             logger.warning(f"Insufficient data for {symbol}")
@@ -264,26 +500,37 @@ def _fetch_stock_data_sync(symbol: str) -> StockData:
         sd.price = float(df["Close"].iloc[-1])
         sd.timestamp = datetime.now()
 
-        # Returns
         close = df["Close"]
         sd.returns_1d = float(close.pct_change(1).iloc[-1])
         sd.returns_5d = float(close.pct_change(5).iloc[-1])
         sd.returns_20d = float(close.pct_change(20).iloc[-1])
-
-        # Realized volatility
-        sd.volatility_20d = float(close.pct_change().rolling(20).std().iloc[-1] * np.sqrt(252))
-
-        # ATR
         sd.atr_14 = _compute_atr(df)
 
-        # Volume profile
+        # Realized vols at multiple windows
+        daily_ret = close.pct_change()
+        rv_5d = float(daily_ret.rolling(5).std().iloc[-1] * np.sqrt(252))
+        rv_10d = float(daily_ret.rolling(10).std().iloc[-1] * np.sqrt(252))
+        rv_20d = float(daily_ret.rolling(20).std().iloc[-1] * np.sqrt(252))
+
         sd.volume_profile = _compute_volume_profile(df)
 
-        # Options metrics (greeks, IV, skew)
-        sd.options = _compute_options_metrics(ticker, sd.price)
+        # Full options analytics
+        gex, ivs, flow, greeks = _compute_full_options(ticker, sd.price, rv_20d)
+        sd.gex = gex
+        sd.iv_surface = ivs
+        sd.iv_surface.rv_5d = rv_5d
+        sd.iv_surface.rv_10d = rv_10d
+        sd.iv_surface.rv_20d = rv_20d
+        sd.options_flow = flow
+        sd.greeks_chain = greeks
 
-        # Fundamentals
-        sd.fundamentals = _compute_fundamentals(ticker)
+        # Fundamentals (light)
+        mcap, beta, sr, ed_str, dte = _compute_fundamentals_lite(ticker)
+        sd.market_cap = mcap
+        sd.beta = beta
+        sd.short_ratio = sr
+        sd.earnings_date = ed_str
+        sd.days_to_earnings = dte
 
     except Exception as e:
         logger.error(f"Failed to fetch data for {symbol}: {e}")
@@ -292,7 +539,6 @@ def _fetch_stock_data_sync(symbol: str) -> StockData:
 
 
 async def fetch_multiple(symbols: list[str]) -> dict[str, StockData]:
-    """Fetch data for multiple symbols concurrently."""
     tasks = [fetch_stock_data(sym) for sym in symbols]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     data = {}
@@ -305,7 +551,6 @@ async def fetch_multiple(symbols: list[str]) -> dict[str, StockData]:
 
 
 async def fetch_current_price(symbol: str) -> float:
-    """Quick price fetch for a single symbol (for sell checks)."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _quick_price, symbol)
 
