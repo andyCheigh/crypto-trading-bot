@@ -10,9 +10,9 @@ STOCK_UNIVERSE = [
     "ORCL", "CRM", "ADBE", "AMD", "INTC", "CSCO", "NFLX", "QCOM",
     "TXN", "AMAT", "MU", "NOW",
     # Mid-cap tech & software (20)
-    "SNOW", "PLTR", "PANW", "CRWD", "ZS", "DDOG", "NET", "SHOP", "SQ",
+    "SNOW", "PLTR", "PANW", "CRWD", "ZS", "DDOG", "NET", "SHOP",
     "COIN", "MRVL", "KLAC", "LRCX", "SNPS", "CDNS", "FTNT", "TEAM",
-    "WDAY", "SPLK", "HUBS",
+    "WDAY", "HUBS", "OKTA", "VEEV",
     # Finance (20)
     "JPM", "V", "MA", "GS", "MS", "BAC", "WFC", "C", "BLK", "SCHW",
     "AXP", "USB", "PNC", "TFC", "COF", "ICE", "CME", "SPGI", "MCO",
@@ -65,7 +65,7 @@ ALGO_WEIGHTS = {
 }
 
 # Buy threshold: ensemble score must exceed this to trigger a buy
-BUY_THRESHOLD = 0.55
+BUY_THRESHOLD = 0.50
 
 # Sell thresholds
 STOP_LOSS_PCT = -0.025       # -2.5% hard stop (tighter for day trading)

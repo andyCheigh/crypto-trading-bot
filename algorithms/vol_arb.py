@@ -82,36 +82,41 @@ class VolArbAlgorithm:
         score = 0.0
         ivs = data.iv_surface
 
-        # 1. IV-RV spread: negative spread means IV is cheap (25%)
+        # 1. IV-RV spread analysis (25%)
+        # Small premium (IV slightly > RV) is normal and healthy for longs
+        # Large premium (IV >> RV) means fear overpriced → mean revert down
+        # Negative premium (IV < RV) means cheap vol → buy
         if ivs.iv_atm > 0 and ivs.rv_20d > 0:
-            spread = ivs.iv_rv_spread / ivs.rv_20d  # normalized
-            if spread < -0.1:  # IV < RV by >10%
-                score += 0.25 * min(abs(spread) / 0.3, 1.0)
+            spread_ratio = ivs.iv_rv_spread / ivs.rv_20d
+            if spread_ratio < 0.15:  # IV not too expensive
+                # Scale: -0.3 = max score, 0.15 = zero
+                iv_score = min((0.15 - spread_ratio) / 0.45, 1.0)
+                score += 0.25 * max(iv_score, 0)
 
-        # 2. GARCH forecast vs IV: forecast > IV means vol will expand (20%)
+        # 2. GARCH forecast vs IV: forecast > IV means vol will expand (15%)
         garch_vol = self._garch_simple_forecast(data)
         if garch_vol > 0 and ivs.iv_atm > 0:
             vol_discount = (garch_vol - ivs.iv_atm) / ivs.iv_atm
-            if vol_discount > 0.05:
-                score += 0.20 * min(vol_discount / 0.2, 1.0)
+            if vol_discount > 0:
+                score += 0.15 * min(vol_discount / 0.15, 1.0)
 
-        # 3. RV cone: low percentile = quiet, building energy (15%)
+        # 3. RV cone: low to mid percentile = room to run (15%)
         rv_pct = self._rv_cone_percentile(data)
-        if rv_pct < 0.3:
-            score += 0.15 * ((0.3 - rv_pct) / 0.3)
+        if rv_pct < 0.5:
+            score += 0.15 * ((0.5 - rv_pct) / 0.5)
 
-        # 4. Vol regime: compressing vol = spring loading (15%)
+        # 4. Vol regime: compressing = coiled spring, energy building (15%)
         regime = self._vol_regime(data)
         if regime == "compressing":
             score += 0.15
 
-        # 5. Term structure in contango (front < back): calm, supportive (15%)
-        if ivs.iv_term_slope < -0.02:
-            score += 0.15 * min(abs(ivs.iv_term_slope) / 0.05, 1.0)
+        # 5. Term structure: contango or flat = calm market (15%)
+        if ivs.iv_term_slope < 0.01:  # Not in backwardation
+            score += 0.15 * min((0.01 - ivs.iv_term_slope) / 0.06, 1.0)
 
-        # 6. 25d skew: elevated put skew = fear = contrarian buy (10%)
-        if ivs.skew_25d > 0.03:
-            score += 0.10 * min(ivs.skew_25d / 0.08, 1.0)
+        # 6. 25d skew: elevated put skew = fear = contrarian buy (15%)
+        if ivs.skew_25d > 0.01:
+            score += 0.15 * min(ivs.skew_25d / 0.06, 1.0)
 
         return round(min(score, 1.0), 4)
 

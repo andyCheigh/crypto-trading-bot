@@ -281,10 +281,14 @@ def _compute_full_options(ticker: yf.Ticker, S: float, rv_20d: float) -> tuple:
             # Process calls
             for _, row in calls.iterrows():
                 K = float(row["strike"])
-                iv = float(row.get("impliedVolatility", 0) or 0)
-                oi = int(row.get("openInterest", 0) or 0)
-                vol = int(row.get("volume", 0) or 0)
-                last = float(row.get("lastPrice", 0) or 0)
+                raw_iv = row.get("impliedVolatility", 0)
+                iv = float(raw_iv) if pd.notna(raw_iv) else 0.0
+                raw_oi = row.get("openInterest", 0)
+                oi = int(raw_oi) if pd.notna(raw_oi) else 0
+                raw_vol = row.get("volume", 0)
+                vol = int(raw_vol) if pd.notna(raw_vol) else 0
+                raw_last = row.get("lastPrice", 0)
+                last = float(raw_last) if pd.notna(raw_last) else 0.0
 
                 if iv <= 0 or iv > 5.0:
                     continue
@@ -304,11 +308,9 @@ def _compute_full_options(ticker: yf.Ticker, S: float, rv_20d: float) -> tuple:
                 ))
 
                 # GEX: dealer is short calls → short gamma on calls
-                # Dealer GEX for calls = -OI * 100 * gamma * S (negative because short)
                 gex_val = -oi * 100 * gamma * S
                 gex_by_strike[K] = gex_by_strike.get(K, 0.0) + gex_val
 
-                # Vanna/Charm flow (dealer short calls → flip signs)
                 total_vanna += -oi * 100 * van
                 total_charm += -oi * 100 * chrm
 
@@ -326,10 +328,14 @@ def _compute_full_options(ticker: yf.Ticker, S: float, rv_20d: float) -> tuple:
             # Process puts
             for _, row in puts.iterrows():
                 K = float(row["strike"])
-                iv = float(row.get("impliedVolatility", 0) or 0)
-                oi = int(row.get("openInterest", 0) or 0)
-                vol = int(row.get("volume", 0) or 0)
-                last = float(row.get("lastPrice", 0) or 0)
+                raw_iv = row.get("impliedVolatility", 0)
+                iv = float(raw_iv) if pd.notna(raw_iv) else 0.0
+                raw_oi = row.get("openInterest", 0)
+                oi = int(raw_oi) if pd.notna(raw_oi) else 0
+                raw_vol = row.get("volume", 0)
+                vol = int(raw_vol) if pd.notna(raw_vol) else 0
+                raw_last = row.get("lastPrice", 0)
+                last = float(raw_last) if pd.notna(raw_last) else 0.0
 
                 if iv <= 0 or iv > 5.0:
                     continue
@@ -349,7 +355,6 @@ def _compute_full_options(ticker: yf.Ticker, S: float, rv_20d: float) -> tuple:
                 ))
 
                 # GEX: dealer is short puts → long gamma on puts
-                # Dealer GEX for puts = +OI * 100 * gamma * S (positive because long)
                 gex_val = oi * 100 * gamma * S
                 gex_by_strike[K] = gex_by_strike.get(K, 0.0) + gex_val
 
@@ -436,6 +441,12 @@ def _compute_full_options(ticker: yf.Ticker, S: float, rv_20d: float) -> tuple:
     return gex, ivs, flow, greeks_chain
 
 
+def _safe_oi(val) -> float:
+    if pd.notna(val):
+        return float(val)
+    return 0.0
+
+
 def _compute_max_pain(calls: pd.DataFrame, puts: pd.DataFrame) -> float:
     all_strikes = sorted(set(calls["strike"].tolist() + puts["strike"].tolist()))
     if not all_strikes:
@@ -443,10 +454,10 @@ def _compute_max_pain(calls: pd.DataFrame, puts: pd.DataFrame) -> float:
     pain = {}
     for strike in all_strikes:
         call_pain = calls[calls["strike"] < strike].apply(
-            lambda r: (strike - r["strike"]) * (r.get("openInterest", 0) or 0), axis=1
+            lambda r: (strike - r["strike"]) * _safe_oi(r.get("openInterest", 0)), axis=1
         ).sum()
         put_pain = puts[puts["strike"] > strike].apply(
-            lambda r: (r["strike"] - strike) * (r.get("openInterest", 0) or 0), axis=1
+            lambda r: (r["strike"] - strike) * _safe_oi(r.get("openInterest", 0)), axis=1
         ).sum()
         pain[strike] = call_pain + put_pain
     return min(pain, key=pain.get) if pain else 0.0

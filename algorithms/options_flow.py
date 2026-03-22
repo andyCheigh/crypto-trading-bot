@@ -96,24 +96,24 @@ class OptionsFlowAlgorithm:
         if pf > 0:
             score += 0.20 * pf
 
-        # 3. Put/Call ratio contrarian buy (extreme fear) (20%)
+        # 3. Put/Call ratio contrarian buy at extremes (15%)
         pcr_sig = self._pcr_contrarian(data)
         if pcr_sig > 0:
-            score += 0.20 * pcr_sig
+            score += 0.15 * pcr_sig
 
         # 4. Max pain above current price (pull up) (15%)
         mp_sig = self._max_pain_signal(data)
         if mp_sig > 0:
             score += 0.15 * mp_sig
 
-        # 5. High put OI ratio (institutional hedging = they own it) (10%)
+        # 5. High put OI ratio (institutional hedging = they own it) (15%)
         oi_sig = self._oi_pcr_trend(data)
         if oi_sig > 0:
-            score += 0.10 * oi_sig
+            score += 0.15 * oi_sig
 
-        # 6. Avoid buying near earnings (penalty) (10%)
+        # 6. Earnings proximity penalty (10%)
         if data.days_to_earnings <= 3:
-            score *= 0.5  # Heavy penalty for earnings proximity
+            score *= 0.5  # Heavy penalty — binary event risk
 
         return round(min(score, 1.0), 4)
 

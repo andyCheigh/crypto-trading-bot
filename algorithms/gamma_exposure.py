@@ -113,18 +113,19 @@ class GammaExposureAlgorithm:
     def buy_score(self, data: StockData) -> float:
         score = 0.0
 
-        # 1. Positive GEX environment: stabilizing, mean-reverting (25%)
-        #    Good for buying dips because dealers cushion the downside
+        # 1. Positive GEX + dip: dealers cushion the downside, buy the dip (25%)
+        #    Positive GEX alone is stabilizing but not a directional signal.
+        #    Combined with a pullback, it's a high-conviction mean-reversion entry.
         if data.gex.net_gex > 0:
-            # In positive gamma, buy when price dipped toward support
-            if data.returns_1d < -0.005:  # Small dip
-                score += 0.25
+            if data.returns_1d < -0.003:
+                score += 0.25  # Dip in positive gamma = strong buy
+            else:
+                score += 0.10  # Positive gamma alone = mild support
 
-        # 2. Price below gamma flip but GEX flipping positive (20%)
-        #    Transitioning from unstable to stable = inflection buy
+        # 2. Price near gamma flip — inflection zone (15%)
         flip_dist = self._price_vs_gamma_flip(data)
         if -0.02 < flip_dist < 0.01:
-            score += 0.20
+            score += 0.15
 
         # 3. Vanna flow bullish (20%)
         vanna_sig = self._vanna_signal(data)
@@ -136,10 +137,10 @@ class GammaExposureAlgorithm:
         if charm_sig > 0:
             score += 0.15 * charm_sig
 
-        # 5. Call wall magnet above price (20%)
+        # 5. Call wall magnet above + put wall support below (25%)
         wall_sig = self._wall_magnet_signal(data)
         if wall_sig > 0:
-            score += 0.20 * wall_sig
+            score += 0.25 * wall_sig
 
         return round(min(score, 1.0), 4)
 
