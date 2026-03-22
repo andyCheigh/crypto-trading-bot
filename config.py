@@ -1,15 +1,33 @@
 INITIAL_CAPITAL = 10_000.0
-MAX_HOLDINGS = 5
+MAX_HOLDINGS = 7
 SELL_CHECK_INTERVAL = 15      # seconds
 BUY_SCAN_INTERVAL = 60        # seconds
 
-# Universe: liquid large-caps with active options markets
+# Universe: 100 liquid large-caps with active options markets
 STOCK_UNIVERSE = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM",
-    "V", "UNH", "XOM", "JNJ", "WMT", "PG", "MA", "HD", "CVX", "MRK",
-    "ABBV", "KO", "PEP", "COST", "AVGO", "LLY", "TMO", "ACN", "MCD",
-    "NFLX", "CRM", "AMD", "INTC", "CSCO", "ADBE", "ORCL", "BA", "GS",
-    "CAT", "DE", "UPS", "RTX",
+    # Mega-cap tech
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO",
+    "ORCL", "CRM", "ADBE", "AMD", "INTC", "CSCO", "NFLX", "QCOM",
+    "TXN", "AMAT", "MU", "NOW",
+    # Finance
+    "JPM", "V", "MA", "GS", "MS", "BAC", "WFC", "C", "BLK", "SCHW",
+    # Healthcare
+    "UNH", "JNJ", "LLY", "MRK", "ABBV", "PFE", "TMO", "ABT", "DHR",
+    "BMY",
+    # Consumer
+    "WMT", "PG", "KO", "PEP", "COST", "MCD", "HD", "LOW", "NKE", "SBUX",
+    # Energy
+    "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY",
+    "HAL",
+    # Industrials
+    "CAT", "DE", "UPS", "RTX", "BA", "HON", "GE", "LMT", "UNP", "MMM",
+    # Communication
+    "DIS", "CMCSA", "T", "VZ", "TMUS", "CHTR", "ATVI", "EA", "WBD",
+    "PARA",
+    # Other large-caps
+    "ACN", "IBM", "PYPL", "SQ", "SHOP", "UBER", "ABNB", "COIN", "SNOW",
+    "PLTR", "PANW", "CRWD", "ZS", "DDOG", "NET", "MELI", "SE", "BABA",
+    "TSM", "ASML",
 ]
 
 # Algorithm weights for ensemble scoring (sum to 1.0)
@@ -28,4 +46,4 @@ TAKE_PROFIT_PCT = 0.05       # +5% take profit
 TRAILING_STOP_PCT = 0.02     # 2% trailing stop from peak
 
 # Per-position sizing: fraction of available cash
-POSITION_SIZE_PCT = 0.20     # 20% of available cash per trade
+POSITION_SIZE_PCT = 0.14     # 14% of available cash per trade

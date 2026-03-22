@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
+import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -156,7 +158,7 @@ class Portfolio:
             f"Equity: ${equity:,.2f}  ({arrow}{total_pnl_pct:.2%})",
             f"P&L: {arrow}${total_pnl:,.2f}",
             f"Cash: ${self.cash:,.2f}",
-            f"Holdings: {self.num_holdings}/5",
+            f"Holdings: {self.num_holdings}/{config.MAX_HOLDINGS}",
             "",
         ]
 
