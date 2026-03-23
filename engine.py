@@ -342,7 +342,7 @@ class TradingEngine:
 
     async def heartbeat_loop(self):
         while True:
-            await asyncio.sleep(900)
+            await asyncio.sleep(3600)
             try:
                 prices = await self._get_current_prices(allow_fetch=is_market_open())
                 status = self.portfolio.format_status(prices)
