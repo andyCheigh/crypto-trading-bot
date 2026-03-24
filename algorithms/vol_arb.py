@@ -1,26 +1,24 @@
 """
 Algorithm 1: Volatility Arbitrage (The Jane Street Edge)
 
-Core principle: Implied volatility systematically overprices realized volatility
-(the Variance Risk Premium). When this premium is extreme, it creates
-directional opportunities in the underlying.
+Exploits the Variance Risk Premium: IV systematically overprices realized vol.
+Now outputs directional CALL/PUT signals based on vol regime analysis.
 
-How the top desks trade this:
-- IV vs RV spread at multiple windows (5d, 10d, 20d realized vs current IV)
-- Volatility cone: where current IV sits vs historical IV distribution
-- GARCH-style vol forecasting to detect mean reversion in vol
-- IV term structure: backwardation (front > back) signals fear/event premium
-- RV acceleration/deceleration for regime detection
+BUY CALL when:
+  - IV cheap relative to RV → vol expansion expected → stock moves up
+  - RV compressing (coiled spring) → breakout imminent
+  - Term structure in contango → calm, supportive of longs
+  - Elevated put skew → fear = contrarian bullish
 
-Buy underlying when:
-  - IV is cheap (low percentile) relative to realized → vol expansion expected
-  - RV is decelerating while IV is flat → stock about to move, cheap entry
-  - Term structure in contango (front < back) → calm market, supportive of longs
+BUY PUT when:
+  - IV extremely expensive → mean reversion in vol = price decline
+  - RV expanding rapidly → exhaustion, reversal imminent
+  - Term structure in steep backwardation → near-term fear/event
+  - Skew collapsing → complacency, no protection = vulnerable to selloff
+  - GARCH forecast << IV → vol will contract, overpriced fear
 
-Sell underlying when:
-  - IV spikes to extreme percentile → mean reversion in vol = mean reversion in price
-  - IV >> RV spread widens → expensive fear premium, take profit before vol crush
-  - Term structure in steep backwardation → near-term event risk
+EXIT (high sell score) when:
+  - Signal reversal (bullish→bearish or vice versa)
 """
 
 from __future__ import annotations
@@ -28,6 +26,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from algorithms.signal import OptionSignal
 from data_fetcher import StockData
 
 
@@ -35,10 +34,7 @@ class VolArbAlgorithm:
     name = "vol_arb"
 
     def _rv_cone_percentile(self, data: StockData) -> float:
-        """Where current RV sits vs its own 60-day rolling distribution.
-        Low percentile = quiet period (potential energy building).
-        High percentile = extended move (exhaustion risk).
-        """
+        """Where current RV sits vs its own 60-day rolling distribution."""
         if data.ohlcv is None or len(data.ohlcv) < 60:
             return 0.5
         daily_ret = data.ohlcv["Close"].pct_change()
@@ -55,7 +51,6 @@ class VolArbAlgorithm:
         ivs = data.iv_surface
         if ivs.rv_5d == 0 or ivs.rv_20d == 0:
             return "stable"
-        # RV acceleration: short-term vol vs longer-term
         rv_ratio = ivs.rv_5d / ivs.rv_20d
         if rv_ratio > 1.3:
             return "expanding"
@@ -64,109 +59,177 @@ class VolArbAlgorithm:
         return "stable"
 
     def _garch_simple_forecast(self, data: StockData) -> float:
-        """Simple EWMA vol forecast (GARCH(1,1) proxy).
-        Returns forecasted vol. If forecast < current IV → IV is overpriced.
-        """
+        """EWMA vol forecast (GARCH(1,1) proxy)."""
         if data.ohlcv is None or len(data.ohlcv) < 30:
             return 0.0
         daily_ret = data.ohlcv["Close"].pct_change().dropna()
-        # EWMA with lambda=0.94 (RiskMetrics standard)
         lam = 0.94
         var_t = daily_ret.var()
         for r in daily_ret.iloc[-20:]:
             var_t = lam * var_t + (1 - lam) * r ** 2
         return float(np.sqrt(var_t * 252))
 
-    def buy_score(self, data: StockData) -> float:
-        """Buy when vol is cheap relative to what we forecast → upside potential."""
-        score = 0.0
+    def signal(self, data: StockData) -> OptionSignal:
+        """Produce directional signal based on vol regime analysis."""
         ivs = data.iv_surface
+        bullish_score = 0.0
+        bearish_score = 0.0
+        component_scores = {}
 
-        # 1. IV-RV spread analysis (25%)
-        # Small premium (IV slightly > RV) is normal and healthy for longs
-        # Large premium (IV >> RV) means fear overpriced → mean revert down
-        # Negative premium (IV < RV) means cheap vol → buy
+        # --- BULLISH COMPONENTS (favor CALL) ---
+
+        # 1. IV-RV spread: IV cheap relative to RV (20%)
+        iv_rv_bull = 0.0
         if ivs.iv_atm > 0 and ivs.rv_20d > 0:
             spread_ratio = ivs.iv_rv_spread / ivs.rv_20d
-            if spread_ratio < 0.15:  # IV not too expensive
-                # Scale: -0.3 = max score, 0.15 = zero
-                iv_score = min((0.15 - spread_ratio) / 0.45, 1.0)
-                score += 0.25 * max(iv_score, 0)
+            if spread_ratio < 0.15:
+                iv_rv_bull = min((0.15 - spread_ratio) / 0.45, 1.0)
+        component_scores["iv_rv_cheap"] = iv_rv_bull
+        bullish_score += 0.20 * iv_rv_bull
 
-        # 2. GARCH forecast vs IV: forecast > IV means vol will expand (15%)
+        # 2. GARCH forecast > IV: vol will expand (15%)
+        garch_bull = 0.0
         garch_vol = self._garch_simple_forecast(data)
         if garch_vol > 0 and ivs.iv_atm > 0:
             vol_discount = (garch_vol - ivs.iv_atm) / ivs.iv_atm
             if vol_discount > 0:
-                score += 0.15 * min(vol_discount / 0.15, 1.0)
+                garch_bull = min(vol_discount / 0.15, 1.0)
+        component_scores["garch_underpriced"] = garch_bull
+        bullish_score += 0.15 * garch_bull
 
-        # 3. RV cone: low to mid percentile = room to run (15%)
+        # 3. RV cone low percentile: room to run up (10%)
         rv_pct = self._rv_cone_percentile(data)
-        if rv_pct < 0.5:
-            score += 0.15 * ((0.5 - rv_pct) / 0.5)
+        rv_bull = max((0.5 - rv_pct) / 0.5, 0.0) if rv_pct < 0.5 else 0.0
+        component_scores["rv_cone_low"] = rv_bull
+        bullish_score += 0.10 * rv_bull
 
-        # 4. Vol regime: compressing = coiled spring, energy building (15%)
+        # 4. Vol compressing: coiled spring → breakout up (15%)
         regime = self._vol_regime(data)
-        if regime == "compressing":
-            score += 0.15
+        compress_bull = 1.0 if regime == "compressing" else 0.0
+        component_scores["vol_compressing"] = compress_bull
+        bullish_score += 0.15 * compress_bull
 
-        # 5. Term structure: contango or flat = calm market (15%)
-        if ivs.iv_term_slope < 0.01:  # Not in backwardation
-            score += 0.15 * min((0.01 - ivs.iv_term_slope) / 0.06, 1.0)
+        # 5. Term structure contango: calm market (10%)
+        contango_bull = 0.0
+        if ivs.iv_term_slope < 0.01:
+            contango_bull = min((0.01 - ivs.iv_term_slope) / 0.06, 1.0)
+        component_scores["term_contango"] = contango_bull
+        bullish_score += 0.10 * contango_bull
 
-        # 6. 25d skew: elevated put skew = fear = contrarian buy (15%)
+        # 6. Elevated put skew: fear = contrarian buy (10%)
+        skew_bull = 0.0
         if ivs.skew_25d > 0.01:
-            score += 0.15 * min(ivs.skew_25d / 0.06, 1.0)
+            skew_bull = min(ivs.skew_25d / 0.06, 1.0)
+        component_scores["skew_elevated"] = skew_bull
+        bullish_score += 0.10 * skew_bull
 
-        return round(min(score, 1.0), 4)
+        # --- BEARISH COMPONENTS (favor PUT) ---
 
-    def sell_score(self, data: StockData, entry_price: float) -> float:
-        """Sell when vol is expensive or exhaustion signals appear."""
-        score = 0.0
-        ivs = data.iv_surface
-
-        # 1. IV spike: IV >> RV (expensive premium) (30%)
+        # 7. IV spike: IV >> RV, expensive premium → mean revert down (20%)
+        iv_spike_bear = 0.0
         if ivs.iv_atm > 0 and ivs.rv_20d > 0:
             spread = ivs.iv_rv_spread / ivs.rv_20d
-            if spread > 0.2:
-                score += 0.30 * min(spread / 0.5, 1.0)
+            if spread > 0.20:
+                iv_spike_bear = min(spread / 0.50, 1.0)
+        component_scores["iv_spike"] = iv_spike_bear
+        bearish_score += 0.20 * iv_spike_bear
 
-        # 2. RV expanding fast (exhaustion coming) (25%)
-        regime = self._vol_regime(data)
-        if regime == "expanding":
-            score += 0.25
+        # 8. RV expanding: exhaustion → reversal (15%)
+        expand_bear = 1.0 if regime == "expanding" else 0.0
+        component_scores["rv_expanding"] = expand_bear
+        bearish_score += 0.15 * expand_bear
 
-        # 3. Term structure backwardation (front >> back): event/fear (25%)
+        # 9. Term structure backwardation: fear/event premium (15%)
+        backw_bear = 0.0
         if ivs.iv_term_slope > 0.03:
-            score += 0.25 * min(ivs.iv_term_slope / 0.08, 1.0)
+            backw_bear = min(ivs.iv_term_slope / 0.08, 1.0)
+        component_scores["term_backwardation"] = backw_bear
+        bearish_score += 0.15 * backw_bear
 
-        # 4. Skew collapse (puts getting cheap): complacency (20%)
+        # 10. Skew collapse: puts getting cheap → complacency (10%)
+        skew_bear = 0.0
         if ivs.skew_25d < -0.01:
-            score += 0.20 * min(abs(ivs.skew_25d) / 0.05, 1.0)
+            skew_bear = min(abs(ivs.skew_25d) / 0.05, 1.0)
+        component_scores["skew_collapse"] = skew_bear
+        bearish_score += 0.10 * skew_bear
 
-        return round(min(score, 1.0), 4)
+        # 11. GARCH forecast << IV: vol overpriced → crush coming (10%)
+        garch_bear = 0.0
+        if garch_vol > 0 and ivs.iv_atm > 0:
+            vol_premium = (ivs.iv_atm - garch_vol) / ivs.iv_atm
+            if vol_premium > 0.15:
+                garch_bear = min(vol_premium / 0.30, 1.0)
+        component_scores["garch_overpriced"] = garch_bear
+        bearish_score += 0.10 * garch_bear
+
+        # 12. RV cone high percentile: extended move, exhaustion (10%)
+        rv_bear = max((rv_pct - 0.7) / 0.3, 0.0) if rv_pct > 0.7 else 0.0
+        component_scores["rv_cone_high"] = rv_bear
+        bearish_score += 0.10 * rv_bear
+
+        # --- Direction decision ---
+        bullish_score = min(bullish_score, 1.0)
+        bearish_score = min(bearish_score, 1.0)
+        component_scores["bullish_total"] = round(bullish_score, 4)
+        component_scores["bearish_total"] = round(bearish_score, 4)
+
+        # Net direction: need meaningful edge over the other side
+        net = bullish_score - bearish_score
+        if net > 0.08:
+            direction = "CALL"
+            conviction = bullish_score
+            # Vol arb prefers slightly higher delta (more directional)
+            # and moderate DTE (enough theta runway but not too far)
+            preferred_delta = 0.40 + 0.10 * min(bullish_score, 1.0)  # 0.40-0.50
+            preferred_dte = 30 if regime != "compressing" else 21  # Shorter for coiled spring
+        elif net < -0.08:
+            direction = "PUT"
+            conviction = bearish_score
+            # For puts, prefer slightly lower delta (more OTM for leverage)
+            preferred_delta = 0.35 + 0.10 * min(bearish_score, 1.0)  # 0.35-0.45
+            preferred_dte = 30 if regime != "expanding" else 21
+        else:
+            direction = "NEUTRAL"
+            conviction = 0.0
+            preferred_delta = 0.40
+            preferred_dte = 30
+
+        return OptionSignal(
+            direction=direction,
+            conviction=round(conviction, 4),
+            scores=component_scores,
+            preferred_delta=round(preferred_delta, 2),
+            preferred_dte=preferred_dte,
+        )
+
+    def sell_score(self, data: StockData, position_direction: str) -> float:
+        """Exit score: how strongly should we close this position?
+        High score = strong reason to exit.
+        """
+        sig = self.signal(data)
+        # If holding a CALL but signal says PUT → strong exit
+        if position_direction == "CALL" and sig.direction == "PUT":
+            return min(0.50 + sig.conviction * 0.50, 1.0)
+        # If holding a PUT but signal says CALL → strong exit
+        if position_direction == "PUT" and sig.direction == "CALL":
+            return min(0.50 + sig.conviction * 0.50, 1.0)
+        # If signal is NEUTRAL → mild exit pressure
+        if sig.direction == "NEUTRAL":
+            return 0.30
+        # Signal agrees with position → no exit pressure
+        return 0.0
 
     def swing_score(self, data: StockData) -> float:
-        """How strong is the case for holding overnight?
-        Returns 0-1: higher = stronger swing signal.
-        """
+        """Overnight hold viability."""
         ivs = data.iv_surface
         score = 0.0
-
-        # Low IV + compressing vol = coiled spring, worth holding
         if ivs.iv_atm > 0 and ivs.rv_20d > 0:
             if ivs.iv_rv_spread < 0:
                 score += 0.3
-
         if self._vol_regime(data) == "compressing":
             score += 0.3
-
-        # Contango term structure = no near-term risk
         if ivs.iv_term_slope < -0.02:
             score += 0.2
-
-        # Not near earnings
         if data.days_to_earnings > 7:
             score += 0.2
-
         return round(min(score, 1.0), 4)

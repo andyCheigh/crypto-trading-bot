@@ -3,6 +3,27 @@ MAX_HOLDINGS = 10
 SELL_CHECK_INTERVAL = 15      # seconds
 BUY_SCAN_INTERVAL = 60        # seconds
 
+# ---------------------------------------------------------------------------
+# Options Contract Selection
+# ---------------------------------------------------------------------------
+TARGET_DELTA_RANGE = (0.30, 0.50)    # Sweet spot: leverage + decent probability
+PREFERRED_DTE_MIN = 14               # Avoid extreme theta decay (weeklies)
+PREFERRED_DTE_MAX = 45               # Avoid low gamma/vega (far-dated)
+MIN_OPEN_INTEREST = 100              # Liquidity filter
+MAX_BID_ASK_SPREAD_PCT = 0.10        # Max 10% bid-ask spread
+CONTRACT_MULTIPLIER = 100             # Standard options multiplier
+
+# ---------------------------------------------------------------------------
+# Greeks-Based Exit Criteria
+# ---------------------------------------------------------------------------
+PREMIUM_STOP_LOSS_PCT = -0.50        # Exit if premium drops 50%
+PREMIUM_TAKE_PROFIT_PCT = 1.00       # Exit if premium doubles (100% gain)
+PREMIUM_TRAILING_STOP_PCT = 0.30     # Exit if premium drops 30% from peak
+DELTA_STOP_LOSS = 0.10               # Exit if |delta| drops below 0.10 (deep OTM)
+IV_CRUSH_EXIT_PCT = 0.20             # Exit if IV drops 20%+ from entry
+MAX_THETA_DECAY_PCT = 0.03           # Exit if daily theta > 3% of position value
+NEAR_EXPIRY_DTE = 3                  # Force close options within 3 DTE (gamma risk)
+
 # Universe: 200 liquid stocks with active options markets
 STOCK_UNIVERSE = [
     # Mega-cap tech (20)
@@ -64,16 +85,11 @@ ALGO_WEIGHTS = {
     "options_flow":     0.30,   # Options Order Flow & Smart Money Sentiment
 }
 
-# Buy threshold: ensemble score must exceed this to trigger a buy
+# Buy threshold: ensemble conviction must exceed this to trigger a trade
 BUY_THRESHOLD = 0.50
 
-# Sell thresholds
-STOP_LOSS_PCT = -0.025       # -2.5% hard stop (tighter for day trading)
-TAKE_PROFIT_PCT = 0.04       # +4% take profit
-TRAILING_STOP_PCT = 0.015    # 1.5% trailing stop from peak
-
-# Per-position sizing: fraction of available cash
-POSITION_SIZE_PCT = 0.10     # 10% of available cash per trade
+# Per-position sizing: max premium allocation as fraction of capital
+POSITION_SIZE_PCT = 0.10     # Max 10% of available cash per option trade
 
 # End-of-day settings
 EOD_CLOSE_TIME_MINUTES_BEFORE = 15  # Start closing positions 15 min before close (3:45 PM ET)

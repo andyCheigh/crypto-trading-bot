@@ -1,5 +1,6 @@
 """
-Telegram bot for sending trade signals and portfolio updates.
+Telegram bot for sending options trade signals and portfolio updates.
+Shows full contract details: strike, expiry, call/put, premium, Greeks.
 """
 
 from __future__ import annotations
@@ -35,23 +36,36 @@ class TelegramNotifier:
 
     async def send_buy_signal(
         self,
-        symbol: str,
-        price: float,
-        shares: int,
-        scores: dict[str, float],
-        ensemble_score: float,
+        display_name: str,
+        premium: float,
+        contracts: int,
+        scores: dict[str, str],
+        ensemble_direction: str,
+        ensemble_conviction: float,
+        greeks: dict,
         portfolio_status: str,
     ):
+        total_cost = premium * contracts * 100
         algo_lines = "\n".join(
-            f"  {name.replace('_', ' ').title()}: {score:.4f}"
-            for name, score in scores.items()
+            f"  {name.replace('_', ' ').title()}: {score_str}"
+            for name, score_str in scores.items()
         )
+
+        delta = greeks.get("delta", 0)
+        gamma = greeks.get("gamma", 0)
+        theta = greeks.get("theta", 0)
+        vega = greeks.get("vega", 0)
+        iv = greeks.get("iv", 0)
+        dte = greeks.get("dte", 0)
+
         msg = (
-            f"BUY SIGNAL: {symbol}\n"
-            f"Price: ${price:.2f} | Shares: {shares} | Cost: ${price * shares:,.2f}\n"
+            f"BUY {ensemble_direction}: {display_name}\n"
+            f"Premium: ${premium:.2f} | Contracts: {contracts} | Cost: ${total_cost:,.2f}\n"
+            f"Greeks: D{delta:.2f} G{gamma:.4f} T{theta:.3f} V{vega:.3f} IV:{iv:.1%}\n"
+            f"DTE: {dte}\n"
             f"\n"
-            f"Options-Driven Scores:\n{algo_lines}\n"
-            f"Ensemble: {ensemble_score:.4f}\n"
+            f"Algorithm Signals:\n{algo_lines}\n"
+            f"Ensemble: {ensemble_conviction:.4f} ({ensemble_direction})\n"
             f"\n"
             f"{portfolio_status}"
         )
@@ -59,19 +73,26 @@ class TelegramNotifier:
 
     async def send_sell_signal(
         self,
-        symbol: str,
-        price: float,
-        shares: int,
+        display_name: str,
+        premium: float,
+        contracts: int,
         pnl: float,
         pnl_pct: float,
         reason: str,
+        greeks: dict,
         portfolio_status: str,
     ):
         arrow = "+" if pnl >= 0 else ""
+        delta = greeks.get("delta", 0)
+        iv = greeks.get("iv", 0)
+        theta = greeks.get("theta", 0)
+        dte = greeks.get("dte", 0)
+
         msg = (
-            f"SELL SIGNAL: {symbol}\n"
-            f"Price: ${price:.2f} | Shares: {shares}\n"
+            f"SELL: {display_name}\n"
+            f"Premium: ${premium:.2f} | Contracts: {contracts}\n"
             f"P&L: {arrow}${pnl:.2f} ({arrow}{pnl_pct:.2%})\n"
+            f"Greeks at exit: D{delta:.2f} T{theta:.3f} IV:{iv:.1%} DTE:{dte}\n"
             f"Reason: {reason}\n"
             f"\n"
             f"{portfolio_status}"
@@ -81,8 +102,9 @@ class TelegramNotifier:
     async def send_startup(self, portfolio_status: str):
         msg = (
             f"OPTIONS TRADING BOT STARTED\n"
-            f"Sell check: every 15s\n"
-            f"Buy scan: every 60s\n"
+            f"Instruments: CALLS & PUTS\n"
+            f"Sell check: every 15s (Greeks + premium stops)\n"
+            f"Buy scan: every 60s (ensemble direction signals)\n"
             f"EOD close: 3:45 PM ET\n"
             f"Max holdings: 10\n"
             f"\n"

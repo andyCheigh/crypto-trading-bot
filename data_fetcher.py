@@ -7,6 +7,7 @@ Pulls full options chains across multiple expirations to compute:
 - IV surface: term structure, skew, smile
 - Unusual options activity detection
 - Volume profile & order flow proxies
+- Contract selection: optimal strike/expiry for trade execution
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import norm
+
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +115,30 @@ class OptionsGreeks:
     charm: float = 0.0
     open_interest: int = 0
     volume: int = 0
+    bid: float = 0.0
+    ask: float = 0.0
+    last_price: float = 0.0
+
+
+@dataclass
+class ContractRecommendation:
+    """Recommended option contract for trade execution."""
+    symbol: str
+    strike: float
+    expiry: str
+    option_type: str         # "CALL" or "PUT"
+    premium: float           # Mid-price (bid+ask)/2 or last price
+    bid: float = 0.0
+    ask: float = 0.0
+    delta: float = 0.0
+    gamma: float = 0.0
+    theta: float = 0.0
+    vega: float = 0.0
+    iv: float = 0.0
+    open_interest: int = 0
+    volume: int = 0
+    dte: int = 0
+    score: float = 0.0       # Composite ranking score
 
 
 @dataclass
@@ -289,6 +316,10 @@ def _compute_full_options(ticker: yf.Ticker, S: float, rv_20d: float) -> tuple:
                 vol = int(raw_vol) if pd.notna(raw_vol) else 0
                 raw_last = row.get("lastPrice", 0)
                 last = float(raw_last) if pd.notna(raw_last) else 0.0
+                raw_bid = row.get("bid", 0)
+                bid = float(raw_bid) if pd.notna(raw_bid) else 0.0
+                raw_ask = row.get("ask", 0)
+                ask = float(raw_ask) if pd.notna(raw_ask) else 0.0
 
                 if iv <= 0 or iv > 5.0:
                     continue
@@ -305,6 +336,7 @@ def _compute_full_options(ticker: yf.Ticker, S: float, rv_20d: float) -> tuple:
                     iv=iv, delta=delta, gamma=gamma, theta=theta,
                     vega=vega, vanna=van, charm=chrm,
                     open_interest=oi, volume=vol,
+                    bid=bid, ask=ask, last_price=last,
                 ))
 
                 # GEX: dealer is short calls → short gamma on calls
@@ -336,6 +368,10 @@ def _compute_full_options(ticker: yf.Ticker, S: float, rv_20d: float) -> tuple:
                 vol = int(raw_vol) if pd.notna(raw_vol) else 0
                 raw_last = row.get("lastPrice", 0)
                 last = float(raw_last) if pd.notna(raw_last) else 0.0
+                raw_bid = row.get("bid", 0)
+                bid = float(raw_bid) if pd.notna(raw_bid) else 0.0
+                raw_ask = row.get("ask", 0)
+                ask = float(raw_ask) if pd.notna(raw_ask) else 0.0
 
                 if iv <= 0 or iv > 5.0:
                     continue
@@ -352,6 +388,7 @@ def _compute_full_options(ticker: yf.Ticker, S: float, rv_20d: float) -> tuple:
                     iv=iv, delta=delta, gamma=gamma, theta=theta,
                     vega=vega, vanna=van, charm=chrm,
                     open_interest=oi, volume=vol,
+                    bid=bid, ask=ask, last_price=last,
                 ))
 
                 # GEX: dealer is short puts → long gamma on puts
@@ -578,3 +615,253 @@ def _quick_price(symbol: str) -> float:
     except Exception as e:
         logger.error(f"Price fetch failed for {symbol}: {e}")
     return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Contract selection engine
+# ---------------------------------------------------------------------------
+
+def select_optimal_contract(
+    symbol: str,
+    greeks_chain: list[OptionsGreeks],
+    direction: str,
+    spot_price: float,
+    preferred_delta: float = 0.0,
+    preferred_dte: int = 0,
+) -> Optional[ContractRecommendation]:
+    """Select the optimal option contract for a given direction.
+
+    Args:
+        symbol: Underlying ticker
+        greeks_chain: Full Greeks chain from data fetch
+        direction: "CALL" or "PUT"
+        spot_price: Current underlying price
+        preferred_delta: Algorithm's preferred delta (0 = use config default)
+        preferred_dte: Algorithm's preferred DTE (0 = use config default)
+
+    Returns:
+        ContractRecommendation or None if no suitable contract found
+    """
+    is_call = direction == "CALL"
+    delta_min, delta_max = config.TARGET_DELTA_RANGE
+    dte_min = preferred_dte - 10 if preferred_dte > 0 else config.PREFERRED_DTE_MIN
+    dte_max = preferred_dte + 10 if preferred_dte > 0 else config.PREFERRED_DTE_MAX
+    target_delta = preferred_delta if preferred_delta > 0 else (delta_min + delta_max) / 2
+
+    candidates = []
+    for g in greeks_chain:
+        if g.is_call != is_call:
+            continue
+
+        # Compute DTE
+        try:
+            exp_date = datetime.strptime(g.expiry, "%Y-%m-%d")
+            dte = max((exp_date - datetime.now()).days, 0)
+        except ValueError:
+            continue
+
+        # Filter DTE
+        if dte < dte_min or dte > dte_max:
+            continue
+
+        # Filter delta (use absolute delta for puts)
+        abs_delta = abs(g.delta)
+        if abs_delta < delta_min or abs_delta > delta_max:
+            continue
+
+        # Filter liquidity
+        if g.open_interest < config.MIN_OPEN_INTEREST:
+            continue
+
+        # Filter bid-ask spread
+        mid_price = (g.bid + g.ask) / 2 if (g.bid > 0 and g.ask > 0) else g.last_price
+        if mid_price <= 0:
+            continue
+        if g.bid > 0 and g.ask > 0:
+            spread_pct = (g.ask - g.bid) / mid_price
+            if spread_pct > config.MAX_BID_ASK_SPREAD_PCT:
+                continue
+
+        # Composite ranking score (higher = better)
+        # 1. Delta proximity to target (40%)
+        delta_score = 1.0 - abs(abs_delta - target_delta) / 0.20
+        delta_score = max(delta_score, 0.0)
+
+        # 2. Liquidity: OI + volume (25%)
+        liq_score = min((g.open_interest + g.volume) / 2000.0, 1.0)
+
+        # 3. IV value: prefer lower IV (buying cheap vol) (20%)
+        iv_score = max(1.0 - g.iv / 0.80, 0.0) if g.iv > 0 else 0.5
+
+        # 4. DTE proximity to target (15%)
+        target_dte = preferred_dte if preferred_dte > 0 else 30
+        dte_score = 1.0 - abs(dte - target_dte) / 30.0
+        dte_score = max(dte_score, 0.0)
+
+        composite = 0.40 * delta_score + 0.25 * liq_score + 0.20 * iv_score + 0.15 * dte_score
+
+        candidates.append(ContractRecommendation(
+            symbol=symbol,
+            strike=g.strike,
+            expiry=g.expiry,
+            option_type=direction,
+            premium=mid_price,
+            bid=g.bid,
+            ask=g.ask,
+            delta=g.delta,
+            gamma=g.gamma,
+            theta=g.theta,
+            vega=g.vega,
+            iv=g.iv,
+            open_interest=g.open_interest,
+            volume=g.volume,
+            dte=dte,
+            score=composite,
+        ))
+
+    if not candidates:
+        # Relax filters: drop OI requirement, widen delta range
+        for g in greeks_chain:
+            if g.is_call != is_call:
+                continue
+            try:
+                exp_date = datetime.strptime(g.expiry, "%Y-%m-%d")
+                dte = max((exp_date - datetime.now()).days, 0)
+            except ValueError:
+                continue
+            if dte < config.PREFERRED_DTE_MIN or dte > config.PREFERRED_DTE_MAX + 15:
+                continue
+            abs_delta = abs(g.delta)
+            if abs_delta < 0.15 or abs_delta > 0.65:
+                continue
+            mid_price = (g.bid + g.ask) / 2 if (g.bid > 0 and g.ask > 0) else g.last_price
+            if mid_price <= 0:
+                continue
+            candidates.append(ContractRecommendation(
+                symbol=symbol, strike=g.strike, expiry=g.expiry,
+                option_type=direction, premium=mid_price,
+                bid=g.bid, ask=g.ask,
+                delta=g.delta, gamma=g.gamma, theta=g.theta, vega=g.vega,
+                iv=g.iv, open_interest=g.open_interest, volume=g.volume,
+                dte=dte, score=0.3,  # Lower score for relaxed-filter contracts
+            ))
+
+    if not candidates:
+        logger.warning(f"No suitable {direction} contracts found for {symbol}")
+        return None
+
+    # Return best scoring contract
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    best = candidates[0]
+    logger.info(
+        f"Selected {best.symbol} {best.expiry} ${best.strike} {best.option_type} "
+        f"@ ${best.premium:.2f} (Δ{best.delta:.2f} IV:{best.iv:.1%} OI:{best.open_interest} DTE:{best.dte})"
+    )
+    return best
+
+
+async def fetch_option_price(symbol: str, strike: float, expiry: str, option_type: str) -> Optional[dict]:
+    """Fetch current bid/ask/last/greeks for a specific option contract.
+
+    Returns dict with keys: premium, bid, ask, delta, gamma, theta, vega, iv, dte
+    or None if fetch fails.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, _fetch_option_price_sync, symbol, strike, expiry, option_type
+    )
+
+
+def _fetch_option_price_sync(symbol: str, strike: float, expiry: str, option_type: str) -> Optional[dict]:
+    """Synchronous option price fetch for a specific contract."""
+    try:
+        ticker = yf.Ticker(symbol)
+
+        # Get underlying price for Greeks calculation
+        hist = ticker.history(period="1d")
+        if hist.empty:
+            return None
+        S = float(hist["Close"].iloc[-1])
+
+        chain = ticker.option_chain(expiry)
+        if option_type == "CALL":
+            df = chain.calls
+        else:
+            df = chain.puts
+
+        if df.empty:
+            return None
+
+        # Find the specific strike
+        row = df[df["strike"] == strike]
+        if row.empty:
+            # Find closest strike
+            df["dist"] = abs(df["strike"] - strike)
+            row = df.loc[[df["dist"].idxmin()]]
+
+        row = row.iloc[0]
+        raw_bid = row.get("bid", 0)
+        bid = float(raw_bid) if pd.notna(raw_bid) else 0.0
+        raw_ask = row.get("ask", 0)
+        ask = float(raw_ask) if pd.notna(raw_ask) else 0.0
+        raw_last = row.get("lastPrice", 0)
+        last = float(raw_last) if pd.notna(raw_last) else 0.0
+        raw_iv = row.get("impliedVolatility", 0)
+        iv = float(raw_iv) if pd.notna(raw_iv) else 0.0
+
+        premium = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
+
+        # Compute current Greeks
+        K = float(row["strike"])
+        r = 0.05
+        exp_date = datetime.strptime(expiry, "%Y-%m-%d")
+        dte = max((exp_date - datetime.now()).days, 1)
+        T = dte / 365.0
+        is_call = option_type == "CALL"
+
+        delta = bs_delta(S, K, T, r, iv, is_call) if iv > 0 else 0.0
+        gamma = bs_gamma(S, K, T, r, iv) if iv > 0 else 0.0
+        theta = bs_theta(S, K, T, r, iv, is_call) if iv > 0 else 0.0
+        vega = bs_vega(S, K, T, r, iv) if iv > 0 else 0.0
+
+        return {
+            "premium": premium,
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "delta": delta,
+            "gamma": gamma,
+            "theta": theta,
+            "vega": vega,
+            "iv": iv,
+            "dte": dte,
+            "underlying_price": S,
+        }
+
+    except Exception as e:
+        logger.error(f"Option price fetch failed for {symbol} {expiry} ${strike} {option_type}: {e}")
+        return None
+
+
+async def fetch_option_prices_batch(
+    positions: list[tuple[str, float, str, str]],
+) -> dict[str, dict]:
+    """Fetch current option prices for multiple positions in parallel.
+
+    Args:
+        positions: list of (symbol, strike, expiry, option_type) tuples
+
+    Returns:
+        dict of option_key -> price_dict
+    """
+    tasks = [
+        fetch_option_price(sym, strike, exp, otype)
+        for sym, strike, exp, otype in positions
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    prices = {}
+    for (sym, strike, exp, otype), result in zip(positions, results):
+        key = f"{sym}_{strike}_{exp}_{otype}"
+        if isinstance(result, dict) and result:
+            prices[key] = result
+    return prices
