@@ -617,6 +617,27 @@ def _quick_price(symbol: str) -> float:
     return 0.0
 
 
+async def fetch_vix() -> float:
+    """Fetch the current CBOE VIX level directly."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _fetch_vix_sync)
+
+
+def _fetch_vix_sync() -> float:
+    """Synchronous VIX fetch via ^VIX ticker."""
+    try:
+        vix = yf.Ticker("^VIX")
+        data = vix.history(period="1d", interval="1m")
+        if not data.empty:
+            return float(data["Close"].iloc[-1])
+        data = vix.history(period="1d")
+        if not data.empty:
+            return float(data["Close"].iloc[-1])
+    except Exception as e:
+        logger.error(f"VIX fetch failed: {e}")
+    return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Contract selection engine
 # ---------------------------------------------------------------------------

@@ -6,6 +6,11 @@ Trades actual option contracts (calls and puts) based on ensemble signals.
 - Sell check: every 15 seconds — Greeks-based exits + premium stops
 - EOD close: at 3:45 PM ET, close near-expiry + weak swing positions
 - All loops run concurrently via asyncio
+
+Risk overlays:
+- Vol regime detection via VIX — adapts sizing, thresholds, algo weights
+- Sector correlation management — max 3 per sector, portfolio beta cap
+- Kelly criterion position sizing — conviction-proportional allocation
 """
 
 from __future__ import annotations
@@ -16,11 +21,14 @@ from datetime import datetime, time, timezone, timedelta
 
 import config
 from algorithms import VolArbAlgorithm, GammaExposureAlgorithm, OptionsFlowAlgorithm, OptionSignal
+from correlation import CorrelationManager
 from data_fetcher import (
     fetch_current_price, fetch_multiple, fetch_option_prices_batch,
-    select_optimal_contract, StockData,
+    fetch_vix, select_optimal_contract, StockData,
 )
 from portfolio import Portfolio
+from position_sizer import PositionSizer
+from regime import VolRegimeDetector, RegimeParams
 from telegram_bot import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -73,12 +81,22 @@ class TradingEngine:
             GammaExposureAlgorithm(),
             OptionsFlowAlgorithm(),
         ]
-        self.algo_weights = config.ALGO_WEIGHTS
+
+        # Risk overlays
+        self.regime_detector = VolRegimeDetector()
+        self.correlation_mgr = CorrelationManager()
+        self.position_sizer = PositionSizer()
+        self.current_regime = RegimeParams()  # defaults to NORMAL
 
         self._held_data_cache: dict[str, StockData] = {}  # symbol -> StockData
         self._portfolio_lock = asyncio.Lock()
         self._was_market_open = False
         self._eod_closed_today = False
+
+    @property
+    def _active_weights(self) -> dict[str, float]:
+        """Return regime-adjusted algo weights."""
+        return self.current_regime.algo_weights
 
     def _ensemble_signal(self, data: StockData) -> tuple[str, float, dict[str, OptionSignal]]:
         """Compute ensemble direction and conviction from all algorithms.
@@ -89,6 +107,7 @@ class TradingEngine:
             conviction: 0-1 weighted conviction
             algo_signals: per-algorithm OptionSignal objects
         """
+        weights = self._active_weights
         algo_signals = {}
         call_conviction = 0.0
         put_conviction = 0.0
@@ -96,7 +115,7 @@ class TradingEngine:
         for algo in self.algorithms:
             sig = algo.signal(data)
             algo_signals[algo.name] = sig
-            w = self.algo_weights.get(algo.name, 0.0)
+            w = weights.get(algo.name, 0.0)
 
             if sig.direction == "CALL":
                 call_conviction += sig.conviction * w
@@ -113,29 +132,32 @@ class TradingEngine:
 
     def _ensemble_sell_score(self, data: StockData, position_direction: str) -> float:
         """Compute ensemble exit score for a held position."""
+        weights = self._active_weights
         total = 0.0
         for algo in self.algorithms:
             s = algo.sell_score(data, position_direction)
-            total += s * self.algo_weights.get(algo.name, 0.0)
+            total += s * weights.get(algo.name, 0.0)
         return round(total, 4)
 
     def _ensemble_swing_score(self, data: StockData) -> float:
         """Aggregate swing score: should we hold overnight?"""
+        weights = self._active_weights
         total = 0.0
         for algo in self.algorithms:
             s = algo.swing_score(data)
-            total += s * self.algo_weights.get(algo.name, 0.0)
+            total += s * weights.get(algo.name, 0.0)
         return round(total, 4)
 
     def _weighted_preferred_params(self, algo_signals: dict[str, OptionSignal]) -> tuple[float, int]:
         """Compute weighted preferred delta and DTE from algorithm signals."""
+        weights = self._active_weights
         total_delta = 0.0
         total_dte = 0.0
         total_weight = 0.0
         for name, sig in algo_signals.items():
             if sig.direction == "NEUTRAL":
                 continue
-            w = self.algo_weights.get(name, 0.0) * sig.conviction
+            w = weights.get(name, 0.0) * sig.conviction
             total_delta += sig.preferred_delta * w
             total_dte += sig.preferred_dte * w
             total_weight += w
@@ -186,6 +208,10 @@ class TradingEngine:
         ]
         price_data = await fetch_option_prices_batch(position_specs)
 
+        # Regime-adjusted stop levels
+        regime_stop = abs(config.PREMIUM_STOP_LOSS_PCT) * self.current_regime.stop_loss_mult
+        regime_trailing = config.PREMIUM_TRAILING_STOP_PCT * self.current_regime.trailing_stop_mult
+
         for key in list(self.portfolio.positions.keys()):
             pos = self.portfolio.positions.get(key)
             if not pos:
@@ -209,20 +235,20 @@ class TradingEngine:
             # - Hard stops (premium stop/take-profit/trailing): always active
             # - Soft/technical exits (Greeks, algo): gated behind min hold time
 
-            # === HARD STOPS — always active ===
+            # === HARD STOPS — always active, regime-adjusted ===
 
-            # 1. Premium stop loss: down 50%
-            if pnl_pct <= config.PREMIUM_STOP_LOSS_PCT:
+            # 1. Premium stop loss (regime widens in high vol)
+            if pnl_pct <= -regime_stop:
                 sell_reason = f"PREMIUM STOP LOSS ({pnl_pct:+.2%})"
 
             # 2. Premium take profit: up 100%
             elif pnl_pct >= config.PREMIUM_TAKE_PROFIT_PCT:
                 sell_reason = f"PREMIUM TAKE PROFIT ({pnl_pct:+.2%})"
 
-            # 3. Trailing stop: premium dropped 30% from peak
+            # 3. Trailing stop (regime widens in high vol)
             elif pos.peak_premium > pos.entry_premium:
                 trailing_drop = (current_premium - pos.peak_premium) / pos.peak_premium
-                if trailing_drop <= -config.PREMIUM_TRAILING_STOP_PCT:
+                if trailing_drop <= -regime_trailing:
                     sell_reason = (
                         f"TRAILING STOP ({trailing_drop:+.2%} from peak "
                         f"${pos.peak_premium:.2f})"
@@ -302,10 +328,22 @@ class TradingEngine:
         if slots_available <= 0:
             return
 
+        # --- Regime detection: fetch VIX every buy cycle ---
+        vix_level = await fetch_vix()
+        self.current_regime = self.regime_detector.detect(vix_level)
+        regime = self.current_regime
+
+        # Regime-adjusted buy threshold
+        buy_threshold = config.BUY_THRESHOLD + regime.buy_threshold_adj
+
         # Exclude underlyings we already have positions on
         held_symbols = {pos.symbol for pos in self.portfolio.positions.values()}
         candidates = [s for s in config.STOCK_UNIVERSE if s not in held_symbols]
-        logger.info(f"Scanning {len(candidates)} stocks ({slots_available} slots open)")
+        logger.info(
+            f"Scanning {len(candidates)} stocks ({slots_available} slots open) "
+            f"[{regime.regime.value} | VIX: {regime.vix_level:.1f} | "
+            f"threshold: {buy_threshold:.2f}]"
+        )
 
         all_data = await fetch_multiple(candidates)
         if not all_data:
@@ -316,18 +354,37 @@ class TradingEngine:
         scored = []
         for symbol, data in all_data.items():
             direction, conviction, algo_signals = self._ensemble_signal(data)
-            if direction in ("CALL", "PUT") and conviction >= config.BUY_THRESHOLD:
-                scored.append((symbol, data, direction, conviction, algo_signals))
+            if direction in ("CALL", "PUT") and conviction >= buy_threshold:
+                # Apply diversification penalty to conviction for ranking
+                div_mult = self.correlation_mgr.diversification_multiplier(
+                    symbol, self.portfolio.positions
+                )
+                if div_mult <= 0:
+                    logger.info(
+                        f"Skipping {symbol}: sector "
+                        f"'{self.correlation_mgr.sector_of(symbol)}' at max"
+                    )
+                    continue
+                adj_conviction = conviction * div_mult
+                scored.append((symbol, data, direction, conviction, adj_conviction, algo_signals))
 
-        # Sort by conviction descending
-        scored.sort(key=lambda x: x[3], reverse=True)
+        # Sort by diversification-adjusted conviction descending
+        scored.sort(key=lambda x: x[4], reverse=True)
 
-        for symbol, data, direction, conviction, algo_signals in scored[:slots_available]:
-            available_cash = self.portfolio.cash
-            max_premium_budget = available_cash * config.POSITION_SIZE_PCT
-            if max_premium_budget < 50:
-                logger.info("Insufficient cash for more buys")
-                break
+        for symbol, data, direction, conviction, adj_conviction, algo_signals in scored[:slots_available]:
+            # Correlation gate: check sector and beta limits
+            premiums = await self._get_current_premiums()
+            equity = self.portfolio.total_equity(premiums)
+            allowed, reason = self.correlation_mgr.can_add_position(
+                symbol=symbol,
+                positions=self.portfolio.positions,
+                data_cache=self._held_data_cache,
+                candidate_beta=data.beta,
+                total_equity=equity,
+            )
+            if not allowed:
+                logger.info(f"Correlation block: {symbol} — {reason}")
+                continue
 
             # Get weighted preferred params from algorithm signals
             pref_delta, pref_dte = self._weighted_preferred_params(algo_signals)
@@ -345,15 +402,19 @@ class TradingEngine:
                 logger.info(f"No suitable {direction} contract for {symbol}, skipping")
                 continue
 
-            # Determine number of contracts
+            # Kelly criterion position sizing
             cost_per_contract = contract.premium * config.CONTRACT_MULTIPLIER
             if cost_per_contract <= 0:
                 continue
-            num_contracts = min(
-                int(max_premium_budget / cost_per_contract),
-                5,  # Cap at 5 contracts per position
+
+            num_contracts = self.position_sizer.compute_size(
+                conviction=conviction,
+                regime=regime,
+                available_cash=self.portfolio.cash,
+                contract_cost=cost_per_contract,
             )
             if num_contracts <= 0:
+                logger.info(f"Kelly says skip {symbol} (insufficient edge or cash)")
                 continue
 
             trade = self.portfolio.buy(
@@ -378,6 +439,7 @@ class TradingEngine:
                 for name, sig in algo_signals.items():
                     scores_summary[name] = f"{sig.direction} ({sig.conviction:.4f})"
 
+                sector = self.correlation_mgr.sector_of(symbol)
                 await self.notifier.send_buy_signal(
                     display_name=trade.display_name,
                     premium=contract.premium,
@@ -393,7 +455,12 @@ class TradingEngine:
                         "iv": contract.iv,
                         "dte": contract.dte,
                     },
-                    portfolio_status=status,
+                    portfolio_status=(
+                        f"Regime: {regime.regime.value} (VIX: {regime.vix_level:.1f})\n"
+                        f"Sector: {sector}\n"
+                        f"Kelly size: {num_contracts} contracts\n\n"
+                        f"{status}"
+                    ),
                 )
 
         # Refresh cache for existing holdings
@@ -500,8 +567,11 @@ class TradingEngine:
             try:
                 premiums = await self._get_current_premiums()
                 status = self.portfolio.format_status(premiums)
+                regime = self.current_regime
                 tag = "MARKET OPEN" if is_market_open() else "MARKET CLOSED"
-                await self.notifier.send_heartbeat(f"[{tag}]\n\n{status}")
+                await self.notifier.send_heartbeat(
+                    f"[{tag}] Regime: {regime.regime.value} (VIX: {regime.vix_level:.1f})\n\n{status}"
+                )
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
 
@@ -514,7 +584,8 @@ class TradingEngine:
                 await self.notifier.send(
                     "MARKET OPENED - Options Trading Active\n"
                     "Algos: Vol Arb | GEX/Dealer Flow | Options Flow\n"
-                    "Trading: CALLS & PUTS"
+                    "Trading: CALLS & PUTS\n"
+                    "Risk: VIX Regime | Sector Limits | Kelly Sizing"
                 )
             elif not currently_open and self._was_market_open:
                 logger.info("Market just closed")
@@ -544,18 +615,26 @@ class TradingEngine:
         logger.info(f"Stock universe: {len(config.STOCK_UNIVERSE)} symbols")
         logger.info(f"Algorithms: {[a.name for a in self.algorithms]}")
         logger.info(f"Target delta: {config.TARGET_DELTA_RANGE}, DTE: {config.PREFERRED_DTE_MIN}-{config.PREFERRED_DTE_MAX}")
+        logger.info(f"Risk overlays: VIX regime | Sector limits ({config.MAX_PER_SECTOR}/sector) | Kelly sizing ({config.KELLY_FRACTION}x)")
         logger.info(f"EOD close at 3:45 PM ET, swing threshold: {config.SWING_HOLD_THRESHOLD}")
 
         market_status = "OPEN" if is_market_open() else "CLOSED"
         self._was_market_open = is_market_open()
 
+        # Initial VIX check
+        vix_level = await fetch_vix()
+        self.current_regime = self.regime_detector.detect(vix_level)
+
         premiums = await self._get_current_premiums()
         status = self.portfolio.format_status(premiums)
+        regime = self.current_regime
         await self.notifier.send_startup(
             f"[Market: {market_status}]\n"
+            f"Regime: {regime.regime.value} (VIX: {regime.vix_level:.1f})\n"
             f"Algos: Vol Arb | GEX/Dealer Flow | Options Flow\n"
             f"Trading: CALLS & PUTS\n"
             f"Delta: {config.TARGET_DELTA_RANGE} | DTE: {config.PREFERRED_DTE_MIN}-{config.PREFERRED_DTE_MAX}\n"
+            f"Risk: {config.MAX_PER_SECTOR}/sector | Beta cap: {config.MAX_PORTFOLIO_BETA} | Kelly: {config.KELLY_FRACTION}x\n"
             f"EOD close: 3:45 PM ET (swing override at {config.SWING_HOLD_THRESHOLD})\n\n"
             f"{status}"
         )

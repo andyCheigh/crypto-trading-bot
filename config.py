@@ -91,8 +91,19 @@ ALGO_WEIGHTS = {
 # Buy threshold: ensemble conviction must exceed this to trigger a trade
 BUY_THRESHOLD = 0.50
 
-# Per-position sizing: max premium allocation as fraction of capital
-POSITION_SIZE_PCT = 0.10     # Max 10% of available cash per option trade
+# ---------------------------------------------------------------------------
+# Kelly Position Sizing
+# ---------------------------------------------------------------------------
+KELLY_FRACTION = 0.50        # Half-Kelly — industry standard for estimation error safety
+MAX_POSITION_PCT = 0.15      # Hard cap: 15% of available cash per trade
+MIN_POSITION_PCT = 0.03      # Floor: 3% to avoid dust positions
+POSITION_SIZE_PCT = 0.10     # Fallback if Kelly unavailable
+
+# ---------------------------------------------------------------------------
+# Portfolio Correlation Management
+# ---------------------------------------------------------------------------
+MAX_PER_SECTOR = 3           # Max positions per sector (prevents concentration)
+MAX_PORTFOLIO_BETA = 2.5     # Portfolio-level beta cap (reasonable for levered options)
 
 # End-of-day settings
 EOD_CLOSE_TIME_MINUTES_BEFORE = 15  # Start closing positions 15 min before close (3:45 PM ET)
