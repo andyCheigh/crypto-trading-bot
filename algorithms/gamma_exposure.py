@@ -102,23 +102,25 @@ class GammaExposureAlgorithm:
 
         # --- BULLISH COMPONENTS (favor CALL) ---
 
-        # 1. Positive GEX + dip: mean-reversion buy (20%)
+        # 1. Positive GEX: dealer long gamma cushions downside (20%)
+        #    Base 0.50: positive gamma is a stabilizing floor, not a catalyst
+        #    Negative GEX at 0.60 is justified — short gamma amplifies moves directionally
         gex_bull = 0.0
         if data.gex.net_gex > 0:
             if data.returns_1d < -0.003:
-                gex_bull = 1.0  # Dip in positive gamma = strong buy
+                gex_bull = 1.0  # Dip in positive gamma = strong mean-reversion buy
             else:
-                gex_bull = 0.40  # Positive gamma alone = mild support
+                gex_bull = 0.50  # Positive gamma = supportive floor
         component_scores["pos_gex_dip"] = gex_bull
         bullish_score += 0.20 * gex_bull
 
-        # 2. Price near gamma flip from below (10%)
+        # 2. Price near gamma flip from below (15%)
         flip_dist = self._price_vs_gamma_flip(data)
         flip_bull = 0.0
         if -0.02 < flip_dist < 0.01:
             flip_bull = 1.0
         component_scores["near_flip_bull"] = flip_bull
-        bullish_score += 0.10 * flip_bull
+        bullish_score += 0.15 * flip_bull
 
         # 3. Vanna bullish (15%)
         vanna_sig = self._vanna_signal(data)
@@ -137,6 +139,19 @@ class GammaExposureAlgorithm:
         wall_bull = max(wall_sig, 0.0)
         component_scores["wall_magnet_bull"] = wall_bull
         bullish_score += 0.15 * wall_bull
+
+        # 6. Price near put wall from above: support magnet (5%)
+        #    Symmetric to bearish call wall rejection — dealers defend put wall
+        pw = data.gex.put_wall
+        put_support_bull = 0.0
+        if pw > 0 and data.price > 0:
+            dist_above_pw = (data.price - pw) / data.price
+            if 0 < dist_above_pw < 0.01:
+                put_support_bull = 0.80  # Sitting right on put wall support
+            elif 0.01 <= dist_above_pw < 0.02:
+                put_support_bull = 0.40  # Near put wall support
+        component_scores["at_put_wall_support"] = put_support_bull
+        bullish_score += 0.05 * put_support_bull
 
         # --- BEARISH COMPONENTS (favor PUT) ---
 

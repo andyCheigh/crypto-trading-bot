@@ -205,6 +205,12 @@ class TradingEngine:
             pnl_pct = pos.unrealized_pnl_pct(current_premium)
             sell_reason = None
 
+            # Tiered exit logic:
+            # - Hard stops (premium stop/take-profit/trailing): always active
+            # - Soft/technical exits (Greeks, algo): gated behind min hold time
+
+            # === HARD STOPS — always active ===
+
             # 1. Premium stop loss: down 50%
             if pnl_pct <= config.PREMIUM_STOP_LOSS_PCT:
                 sell_reason = f"PREMIUM STOP LOSS ({pnl_pct:+.2%})"
@@ -222,18 +228,22 @@ class TradingEngine:
                         f"${pos.peak_premium:.2f})"
                     )
 
+            # === SOFT/TECHNICAL EXITS — need time to develop ===
+            hold_seconds = (datetime.now() - pos.entry_time).total_seconds()
+            past_cooldown = hold_seconds >= config.MIN_HOLD_SECONDS
+
             # 4. Delta decay: option going deep OTM
-            if sell_reason is None and abs(current_delta) < config.DELTA_STOP_LOSS:
+            if sell_reason is None and past_cooldown and abs(current_delta) < config.DELTA_STOP_LOSS:
                 sell_reason = f"DELTA DECAY (Δ{current_delta:.3f} < {config.DELTA_STOP_LOSS})"
 
             # 5. IV crush: IV dropped significantly from entry
-            if sell_reason is None and pos.entry_iv > 0 and current_iv > 0:
+            if sell_reason is None and past_cooldown and pos.entry_iv > 0 and current_iv > 0:
                 iv_change = (current_iv - pos.entry_iv) / pos.entry_iv
                 if iv_change < -config.IV_CRUSH_EXIT_PCT:
                     sell_reason = f"IV CRUSH (IV: {pos.entry_iv:.1%} → {current_iv:.1%}, {iv_change:+.1%})"
 
             # 6. Theta bleed: daily decay exceeds threshold
-            if sell_reason is None and current_premium > 0:
+            if sell_reason is None and past_cooldown and current_premium > 0:
                 daily_theta_pct = abs(current_theta) / current_premium
                 if daily_theta_pct > config.MAX_THETA_DECAY_PCT:
                     sell_reason = f"THETA BLEED (Θ{current_theta:.3f}, {daily_theta_pct:.1%}/day)"
@@ -243,7 +253,7 @@ class TradingEngine:
                 sell_reason = f"NEAR EXPIRY ({current_dte} DTE)"
 
             # 8. Algo-based sell signal
-            if sell_reason is None and pos.symbol in self._held_data_cache:
+            if sell_reason is None and past_cooldown and pos.symbol in self._held_data_cache:
                 cached = self._held_data_cache[pos.symbol]
                 ensemble_sell = self._ensemble_sell_score(cached, pos.option_type)
                 if ensemble_sell > 0.55:

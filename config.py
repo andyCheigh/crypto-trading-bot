@@ -21,7 +21,8 @@ PREMIUM_TAKE_PROFIT_PCT = 1.00       # Exit if premium doubles (100% gain)
 PREMIUM_TRAILING_STOP_PCT = 0.30     # Exit if premium drops 30% from peak
 DELTA_STOP_LOSS = 0.10               # Exit if |delta| drops below 0.10 (deep OTM)
 IV_CRUSH_EXIT_PCT = 0.20             # Exit if IV drops 20%+ from entry
-MAX_THETA_DECAY_PCT = 0.03           # Exit if daily theta > 3% of position value
+MAX_THETA_DECAY_PCT = 0.05           # Exit if daily theta > 5% of premium (~10-12 DTE territory, early warning before 3 DTE hard cutoff)
+MIN_HOLD_SECONDS = 180               # Minimum hold time before evaluating exits (3 min cooldown)
 NEAR_EXPIRY_DTE = 3                  # Force close options within 3 DTE (gamma risk)
 
 # Universe: 200 liquid stocks with active options markets
@@ -73,6 +74,8 @@ STOCK_UNIVERSE = [
     # International ADRs (10)
     "BABA", "SE", "MELI", "NU", "GRAB", "PDD", "JD", "BIDU", "NIO",
     "LI",
+    # ETFs — most liquid options markets in the world
+    "SPY",
     # Misc high-options-volume (10)
     "ACN", "IBM", "GM", "F", "RIVN", "LCID", "SMCI", "AI", "IONQ",
     "RGTI",
