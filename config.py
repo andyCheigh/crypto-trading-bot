@@ -89,7 +89,9 @@ ALGO_WEIGHTS = {
 }
 
 # Buy threshold: ensemble conviction must exceed this to trigger a trade
-BUY_THRESHOLD = 0.50
+# With weights summing to 1.0, 0.35 requires 2+ algos to agree with solid conviction
+# (e.g., 2 algos at 0.50 each = 0.35*0.50 + 0.35*0.50 = 0.35)
+BUY_THRESHOLD = 0.35
 
 # ---------------------------------------------------------------------------
 # Kelly Position Sizing

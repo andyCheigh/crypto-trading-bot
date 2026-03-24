@@ -74,7 +74,7 @@ _REGIME_PARAMS = {
     VolRegime.HIGH_VOL: RegimeParams(
         regime=VolRegime.HIGH_VOL,
         position_size_mult=0.7,     # reduce size — wider swings
-        buy_threshold_adj=0.10,     # demand higher conviction
+        buy_threshold_adj=0.05,     # modest conviction bump — still want to trade
         stop_loss_mult=1.3,         # widen stops to avoid noise
         trailing_stop_mult=1.2,
         algo_weights={              # GEX dominates — dealer hedging drives price
@@ -86,7 +86,7 @@ _REGIME_PARAMS = {
     VolRegime.CRISIS: RegimeParams(
         regime=VolRegime.CRISIS,
         position_size_mult=0.4,     # survival mode — capital preservation
-        buy_threshold_adj=0.20,     # only highest conviction
+        buy_threshold_adj=0.15,     # high conviction required but not impossible
         stop_loss_mult=1.5,         # wide stops — everything is noisy
         trailing_stop_mult=1.4,
         algo_weights={              # GEX is king in crisis — dealer flows = the market
@@ -101,9 +101,10 @@ _REGIME_PARAMS = {
 class VolRegimeDetector:
     """Detects market vol regime from CBOE VIX."""
 
-    # VIX thresholds — standard institutional breakpoints
-    VIX_LOW = 14.0        # below: low vol, grind-up
-    VIX_HIGH = 22.0       # above: elevated fear
+    # VIX thresholds — calibrated to actual market regimes
+    # VIX 22-25 is common and not truly elevated — real fear starts at 25+
+    VIX_LOW = 15.0        # below: low vol, grind-up
+    VIX_HIGH = 25.0       # above: genuinely elevated fear
     VIX_CRISIS = 35.0     # above: full panic
 
     # Hysteresis: require N consecutive confirmations before switching
