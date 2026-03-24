@@ -11,6 +11,7 @@ confirmations before switching regimes.
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
@@ -19,9 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 class VolRegime(Enum):
-    LOW_VOL = "LOW_VOL"       # VIX < 14: quiet, grind-up market
-    NORMAL = "NORMAL"         # VIX 14-22: standard conditions
-    HIGH_VOL = "HIGH_VOL"     # VIX 22-35: elevated fear, wider ranges
+    LOW_VOL = "LOW_VOL"       # VIX < 15: quiet, grind-up market
+    NORMAL = "NORMAL"         # VIX 15-25: standard conditions
+    HIGH_VOL = "HIGH_VOL"     # VIX 25-35: elevated fear, wider ranges
     CRISIS = "CRISIS"         # VIX 35+: panic, correlation spikes
 
 
@@ -130,7 +131,7 @@ class VolRegimeDetector:
         """
         if vix_level <= 0:
             logger.warning("VIX data unavailable, maintaining current regime")
-            params = _REGIME_PARAMS[self._current_regime]
+            params = copy.copy(_REGIME_PARAMS[self._current_regime])
             params.vix_level = 0.0
             return params
 
@@ -166,7 +167,7 @@ class VolRegimeDetector:
             self._pending_regime = None
             self._confirmation_count = 0
 
-        params = _REGIME_PARAMS[self._current_regime]
+        params = copy.copy(_REGIME_PARAMS[self._current_regime])
         params.vix_level = vix_level
         logger.info(
             f"Regime: {self._current_regime.value} | VIX: {vix_level:.1f} | "
