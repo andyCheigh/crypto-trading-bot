@@ -103,14 +103,15 @@ class GammaExposureAlgorithm:
         # --- BULLISH COMPONENTS (favor CALL) ---
 
         # 1. Positive GEX: dealer long gamma cushions downside (20%)
-        #    Base 0.50: positive gamma is a stabilizing floor, not a catalyst
+        #    Base 0.65: positive gamma is more than just a floor — dealers actively
+        #    buy dips and sell rips, creating a persistent upward bias in calm markets.
         #    Negative GEX at 0.60 is justified — short gamma amplifies moves directionally
         gex_bull = 0.0
         if data.gex.net_gex > 0:
             if data.returns_1d < -0.003:
                 gex_bull = 1.0  # Dip in positive gamma = strong mean-reversion buy
             else:
-                gex_bull = 0.50  # Positive gamma = supportive floor
+                gex_bull = 0.65  # Positive gamma = persistent bullish floor
         component_scores["pos_gex_dip"] = gex_bull
         bullish_score += 0.20 * gex_bull
 
@@ -199,20 +200,21 @@ class GammaExposureAlgorithm:
         component_scores["wall_magnet_bear"] = wall_bear
         bearish_score += 0.10 * wall_bear
 
-        # --- Direction ---
-        bullish_score = min(bullish_score, 1.0)
-        bearish_score = min(bearish_score, 1.0)
+        # --- Conviction calibration ---
+        # Scale raw component sums to produce meaningful conviction for ensemble.
+        bullish_score = min(bullish_score * 2.0, 1.0)
+        bearish_score = min(bearish_score * 2.0, 1.0)
         component_scores["bullish_total"] = round(bullish_score, 4)
         component_scores["bearish_total"] = round(bearish_score, 4)
 
         net = bullish_score - bearish_score
-        if net > 0.08:
+        if net > 0.05:
             direction = "CALL"
             conviction = bullish_score
             # GEX signals are short-term: prefer closer expiry, higher delta
             preferred_delta = 0.45
             preferred_dte = 21
-        elif net < -0.08:
+        elif net < -0.05:
             direction = "PUT"
             conviction = bearish_score
             # Puts in negative gamma: slightly OTM for leverage on accelerating move

@@ -1,7 +1,7 @@
 INITIAL_CAPITAL = 10_000.0
 MAX_HOLDINGS = 10
-SELL_CHECK_INTERVAL = 15      # seconds
-BUY_SCAN_INTERVAL = 60        # seconds
+SELL_CHECK_INTERVAL = 30      # seconds (avoids yfinance rate limits with concurrent buy scans)
+BUY_SCAN_INTERVAL = 120       # seconds (avoids yfinance rate limits with 200+ symbols)
 
 # ---------------------------------------------------------------------------
 # Options Contract Selection
@@ -9,7 +9,7 @@ BUY_SCAN_INTERVAL = 60        # seconds
 TARGET_DELTA_RANGE = (0.30, 0.50)    # Sweet spot: leverage + decent probability
 PREFERRED_DTE_MIN = 14               # Avoid extreme theta decay (weeklies)
 PREFERRED_DTE_MAX = 45               # Avoid low gamma/vega (far-dated)
-MIN_OPEN_INTEREST = 100              # Liquidity filter
+MIN_OPEN_INTEREST = 50               # Liquidity filter (50 sufficient for small account)
 MAX_BID_ASK_SPREAD_PCT = 0.10        # Max 10% bid-ask spread
 CONTRACT_MULTIPLIER = 100             # Standard options multiplier
 
@@ -106,6 +106,12 @@ POSITION_SIZE_PCT = 0.10     # Fallback if Kelly unavailable
 # ---------------------------------------------------------------------------
 MAX_PER_SECTOR = 3           # Max positions per sector (prevents concentration)
 MAX_PORTFOLIO_BETA = 2.5     # Portfolio-level beta cap (reasonable for levered options)
+
+# ---------------------------------------------------------------------------
+# Risk Circuit Breakers
+# ---------------------------------------------------------------------------
+MAX_DRAWDOWN_PCT = 0.20          # Kill switch: stop ALL new buys if equity drops 20% from peak
+                                  # Every real desk has this. Prevents catastrophic loss spirals.
 
 # End-of-day settings
 EOD_CLOSE_TIME_MINUTES_BEFORE = 15  # Start closing positions 15 min before close (3:45 PM ET)

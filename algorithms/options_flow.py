@@ -92,22 +92,22 @@ class OptionsFlowAlgorithm:
         mp_sig = self._max_pain_signal(data)
         oi_sig = self._oi_pcr_trend(data)
 
-        # --- BULLISH COMPONENTS (favor CALL) ---
+        # --- BULLISH COMPONENTS (favor CALL) — weights sum to 0.80 ---
 
-        # 1. Unusual call activity dominant (20%)
+        # 1. Unusual call activity dominant (25%)
         uoa_bull = max(uoa, 0.0)
         component_scores["uoa_calls"] = uoa_bull
-        bullish_score += 0.20 * uoa_bull
+        bullish_score += 0.25 * uoa_bull
 
-        # 2. Net premium flow bullish (15%)
+        # 2. Net premium flow bullish (20%)
         pf_bull = max(pf, 0.0)
         component_scores["premium_bullish"] = pf_bull
-        bullish_score += 0.15 * pf_bull
+        bullish_score += 0.20 * pf_bull
 
-        # 3. PCR contrarian buy at extremes (12%)
+        # 3. PCR contrarian buy at extremes (15%)
         pcr_bull = max(pcr_sig, 0.0)
         component_scores["pcr_fear_buy"] = pcr_bull
-        bullish_score += 0.12 * pcr_bull
+        bullish_score += 0.15 * pcr_bull
 
         # 4. Max pain above (pull up) (10%)
         mp_bull = max(mp_sig, 0.0)
@@ -119,22 +119,22 @@ class OptionsFlowAlgorithm:
         component_scores["put_oi_support"] = oi_bull
         bullish_score += 0.10 * oi_bull
 
-        # --- BEARISH COMPONENTS (favor PUT) ---
+        # --- BEARISH COMPONENTS (favor PUT) — weights sum to 0.80 ---
 
-        # 6. Unusual put activity dominant (20%)
+        # 6. Unusual put activity dominant (25%)
         uoa_bear = max(-uoa, 0.0)
         component_scores["uoa_puts"] = uoa_bear
-        bearish_score += 0.20 * uoa_bear
+        bearish_score += 0.25 * uoa_bear
 
-        # 7. Net premium flow bearish (15%)
+        # 7. Net premium flow bearish (20%)
         pf_bear = max(-pf, 0.0)
         component_scores["premium_bearish"] = pf_bear
-        bearish_score += 0.15 * pf_bear
+        bearish_score += 0.20 * pf_bear
 
-        # 8. PCR low = complacency = contrarian sell (12%)
+        # 8. PCR low = complacency = contrarian sell (15%)
         pcr_bear = max(-pcr_sig, 0.0)
         component_scores["pcr_complacency"] = pcr_bear
-        bearish_score += 0.12 * pcr_bear
+        bearish_score += 0.15 * pcr_bear
 
         # 9. Max pain below (pull down) (10%)
         mp_bear = max(-mp_sig, 0.0)
@@ -154,6 +154,10 @@ class OptionsFlowAlgorithm:
 
         bullish_score = min(bullish_score * earnings_multiplier, 1.0)
         bearish_score = min(bearish_score * earnings_multiplier, 1.0)
+
+        # Conviction calibration: scale raw scores to ensemble-useful range.
+        bullish_score = min(bullish_score * 2.0, 1.0)
+        bearish_score = min(bearish_score * 2.0, 1.0)
         component_scores["bullish_total"] = round(bullish_score, 4)
         component_scores["bearish_total"] = round(bearish_score, 4)
 

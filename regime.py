@@ -75,7 +75,7 @@ _REGIME_PARAMS = {
     VolRegime.HIGH_VOL: RegimeParams(
         regime=VolRegime.HIGH_VOL,
         position_size_mult=0.7,     # reduce size — wider swings
-        buy_threshold_adj=0.05,     # modest conviction bump — still want to trade
+        buy_threshold_adj=0.03,     # slightly tighter bar but not enough to kill signal generation
         stop_loss_mult=1.3,         # widen stops to avoid noise
         trailing_stop_mult=1.2,
         algo_weights={              # GEX dominates — dealer hedging drives price

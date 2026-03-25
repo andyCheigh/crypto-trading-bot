@@ -42,14 +42,19 @@ class PositionSizer:
     def _conviction_to_win_prob(conviction: float) -> float:
         """Map ensemble conviction (0-1) to estimated win probability.
 
-        conviction 0.50 (buy threshold) → p ≈ 0.60 (barely profitable)
-        conviction 0.75 (strong)        → p ≈ 0.68
-        conviction 1.00 (maximum)       → p ≈ 0.75
+        Calibrated for 2.0x conviction scaler — typical range is 0.35-0.80.
+        Uses a conservative mapping so that even strong signals don't imply
+        unrealistic win rates (options have fat tails and binary outcomes).
 
-        Linear: p = 0.45 + 0.30 * conviction, clamped to [0.50, 0.80]
+        conviction 0.35 (threshold) → p ≈ 0.55 (barely profitable)
+        conviction 0.55 (moderate)  → p ≈ 0.58
+        conviction 0.80 (strong)    → p ≈ 0.63
+        conviction 1.00 (maximum)   → p ≈ 0.67
+
+        Linear: p = 0.50 + 0.17 * conviction, clamped to [0.52, 0.70]
         """
-        p = 0.45 + 0.30 * conviction
-        return max(0.50, min(p, 0.80))
+        p = 0.50 + 0.17 * conviction
+        return max(0.52, min(p, 0.70))
 
     def compute_size(
         self,

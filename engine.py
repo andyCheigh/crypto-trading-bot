@@ -89,9 +89,11 @@ class TradingEngine:
         self.current_regime = RegimeParams()  # defaults to NORMAL
 
         self._held_data_cache: dict[str, StockData] = {}  # symbol -> StockData
-        self._portfolio_lock = asyncio.Lock()
+        self._portfolio_lock: asyncio.Lock | None = None  # created in run() inside event loop
         self._was_market_open = False
         self._eod_closed_today = False
+        self._peak_equity = config.INITIAL_CAPITAL  # High-water mark for drawdown circuit breaker
+        self._circuit_breaker_tripped = False
 
     @property
     def _active_weights(self) -> dict[str, float]:
@@ -189,7 +191,7 @@ class TradingEngine:
     # ------------------------------------------------------------------
 
     async def sell_loop(self):
-        logger.info("Sell loop started (every 15s)")
+        logger.info(f"Sell loop started (every {config.SELL_CHECK_INTERVAL}s)")
         while True:
             if is_market_open() and not is_eod_window():
                 try:
@@ -311,21 +313,49 @@ class TradingEngine:
     # ------------------------------------------------------------------
 
     async def buy_loop(self):
-        logger.info("Buy loop started (every 60s)")
+        logger.info(f"Buy loop started (every {config.BUY_SCAN_INTERVAL}s)")
         await asyncio.sleep(5)
         while True:
             if is_market_open() and not is_eod_window():
                 try:
-                    async with self._portfolio_lock:
-                        if self.portfolio.num_holdings < config.MAX_HOLDINGS:
-                            await self._scan_for_buys()
+                    # Don't hold lock during entire scan — only acquire for
+                    # portfolio mutations. This ensures the sell loop (risk)
+                    # is never blocked by the buy scan (alpha).
+                    if self.portfolio.num_holdings < config.MAX_HOLDINGS:
+                        await self._scan_for_buys()
                 except Exception as e:
                     logger.error(f"Buy loop error: {e}", exc_info=True)
             await asyncio.sleep(config.BUY_SCAN_INTERVAL)
 
+    def _update_circuit_breaker(self, equity: float):
+        """Update high-water mark and check drawdown circuit breaker."""
+        if equity > self._peak_equity:
+            self._peak_equity = equity
+        drawdown = (self._peak_equity - equity) / self._peak_equity
+        if drawdown >= config.MAX_DRAWDOWN_PCT:
+            if not self._circuit_breaker_tripped:
+                self._circuit_breaker_tripped = True
+                logger.warning(
+                    f"CIRCUIT BREAKER TRIPPED: equity ${equity:,.2f} is "
+                    f"{drawdown:.1%} below peak ${self._peak_equity:,.2f}. "
+                    f"All new buys halted."
+                )
+        elif self._circuit_breaker_tripped and drawdown < config.MAX_DRAWDOWN_PCT * 0.5:
+            # Reset circuit breaker once drawdown recovers to half the threshold
+            self._circuit_breaker_tripped = False
+            logger.info("Circuit breaker reset — drawdown recovered.")
+
     async def _scan_for_buys(self):
         slots_available = config.MAX_HOLDINGS - self.portfolio.num_holdings
         if slots_available <= 0:
+            return
+
+        # --- Circuit breaker check ---
+        premiums = await self._get_current_premiums()
+        equity = self.portfolio.total_equity(premiums)
+        self._update_circuit_breaker(equity)
+        if self._circuit_breaker_tripped:
+            logger.info("Circuit breaker active — skipping buy scan")
             return
 
         # --- Regime detection: fetch VIX every buy cycle ---
@@ -352,8 +382,22 @@ class TradingEngine:
 
         # Score all candidates with ensemble signal
         scored = []
+        call_count = 0
+        put_count = 0
+        neutral_count = 0
+        top_calls = []   # track best CALL signals for diagnostics
         for symbol, data in all_data.items():
             direction, conviction, algo_signals = self._ensemble_signal(data)
+            if direction == "CALL":
+                call_count += 1
+                if len(top_calls) < 5 or conviction > top_calls[-1][1]:
+                    top_calls.append((symbol, conviction))
+                    top_calls.sort(key=lambda x: x[1], reverse=True)
+                    top_calls = top_calls[:5]
+            elif direction == "PUT":
+                put_count += 1
+            else:
+                neutral_count += 1
             if direction in ("CALL", "PUT") and conviction >= buy_threshold:
                 # Apply diversification penalty to conviction for ranking
                 div_mult = self.correlation_mgr.diversification_multiplier(
@@ -367,6 +411,15 @@ class TradingEngine:
                     continue
                 adj_conviction = conviction * div_mult
                 scored.append((symbol, data, direction, conviction, adj_conviction, algo_signals))
+
+        # Log signal distribution for diagnostics
+        logger.info(
+            f"Signal distribution: {call_count} CALL | {put_count} PUT | {neutral_count} NEUTRAL "
+            f"| {len(scored)} passed threshold ({buy_threshold:.2f})"
+        )
+        if top_calls:
+            calls_str = ", ".join(f"{s}:{c:.3f}" for s, c in top_calls)
+            logger.info(f"Top CALL signals: {calls_str}")
 
         # Sort by diversification-adjusted conviction descending
         scored.sort(key=lambda x: x[4], reverse=True)
@@ -417,17 +470,19 @@ class TradingEngine:
                 logger.info(f"Kelly says skip {symbol} (insufficient edge or cash)")
                 continue
 
-            trade = self.portfolio.buy(
-                symbol=symbol,
-                strike=contract.strike,
-                expiry=contract.expiry,
-                option_type=contract.option_type,
-                premium=contract.premium,
-                contracts=num_contracts,
-                entry_iv=contract.iv,
-                entry_delta=contract.delta,
-                reason=f"Ensemble: {conviction:.4f} {direction}",
-            )
+            # Acquire lock only for the portfolio mutation — keeps sell loop unblocked
+            async with self._portfolio_lock:
+                trade = self.portfolio.buy(
+                    symbol=symbol,
+                    strike=contract.strike,
+                    expiry=contract.expiry,
+                    option_type=contract.option_type,
+                    premium=contract.premium,
+                    contracts=num_contracts,
+                    entry_iv=contract.iv,
+                    entry_delta=contract.delta,
+                    reason=f"Ensemble: {conviction:.4f} {direction}",
+                )
 
             if trade:
                 self._held_data_cache[symbol] = data
@@ -609,6 +664,8 @@ class TradingEngine:
     # ------------------------------------------------------------------
 
     async def run(self):
+        # Create lock inside event loop (Python 3.9 requires this)
+        self._portfolio_lock = asyncio.Lock()
         logger.info("Starting options trading engine...")
         logger.info(f"Initial capital: ${config.INITIAL_CAPITAL:,.2f}")
         logger.info(f"Max holdings: {config.MAX_HOLDINGS}")
